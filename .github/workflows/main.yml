@@ -1,0 +1,130 @@
+name: Clone Programming Language Repositories
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  clone-repositories:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Workspace
+        run: |
+          mkdir -p Swift Python Lua C Cpp ObjectiveC CSharp Ruby JavaScript TypeScript
+
+      - name: Clone Swift Repositories
+        run: |
+          git clone --depth 1 https://github.com/apple/swift.git Swift/swift
+          git clone --depth 1 https://github.com/TheAlgorithms/Swift.git Swift/TheAlgorithms-Swift
+          git clone --depth 1 https://github.com/Alamofire/Alamofire.git Swift/Alamofire
+          git clone --depth 1 https://github.com/SwiftPackageIndex/SwiftPackageIndex.git Swift/SwiftPackageIndex
+          git clone --depth 1 https://github.com/onmyway133/SwiftUI-Examples.git Swift/SwiftUI-Examples
+        continue-on-error: true
+
+      - name: Clone Python Repositories
+        run: |
+          git clone --depth 1 https://github.com/python/cpython.git Python/cpython
+          git clone --depth 1 https://github.com/TheAlgorithms/Python.git Python/TheAlgorithms-Python
+          git clone --depth 1 https://github.com/django/django.git Python/django
+          git clone --depth 1 https://github.com/pallets/flask.git Python/flask
+          git clone --depth 1 https://github.com/numpy/numpy.git Python/numpy
+        continue-on-error: true
+
+      - name: Clone Lua Repositories
+        run: |
+          git clone --depth 1 https://github.com/lua/lua.git Lua/lua
+          git clone --depth 1 https://github.com/LuaDist/lua.git Lua/LuaDist-lua
+          git clone --depth 1 https://github.com/luvit/luvit.git Lua/luvit
+          git clone --depth 1 https://github.com/luarocks/luarocks.git Lua/luarocks
+          git clone --depth 1 https://github.com/love2d/love.git Lua/love
+        continue-on-error: true
+
+      - name: Clone C Repositories
+        run: |
+          git clone --depth 1 https://github.com/gcc-mirror/gcc.git C/gcc
+          git clone --depth 1 https://github.com/llvm/llvm-project.git C/llvm-project
+          git clone --depth 1 https://github.com/TheAlgorithms/C.git C/TheAlgorithms-C
+          git clone --depth 1 https://github.com/torvalds/linux.git C/linux
+          git clone --depth 1 https://github.com/sqlite/sqlite.git C/sqlite
+        continue-on-error: true
+
+      - name: Clone C++ Repositories
+        run: |
+          git clone --depth 1 https://github.com/gcc-mirror/gcc.git Cpp/gcc
+          git clone --depth 1 https://github.com/llvm/llvm-project.git Cpp/llvm-project
+          git clone --depth 1 https://github.com/TheAlgorithms/C-Plus-Plus.git Cpp/TheAlgorithms-Cpp
+          git clone --depth 1 https://github.com/boostorg/boost.git Cpp/boost
+          git clone --depth 1 https://github.com/opencv/opencv.git Cpp/opencv
+        continue-on-error: true
+
+      - name: Clone Objective-C Repositories
+        run: |
+          git clone --depth 1 https://github.com/llvm/llvm-project.git ObjectiveC/llvm-project
+          git clone --depth 1 https://github.com/AFNetworking/AFNetworking.git ObjectiveC/AFNetworking
+          git clone --depth 1 https://github.com/SnapKit/Masonry.git ObjectiveC/Masonry
+          git clone --depth 1 https://github.com/CocoaPods/CocoaPods.git ObjectiveC/CocoaPods
+          git clone --depth 1 https://github.com/realm/realm-cocoa.git ObjectiveC/realm-cocoa
+        continue-on-error: true
+
+      - name: Clone C# Repositories
+        run: |
+          git clone --depth 1 https://github.com/dotnet/roslyn.git CSharp/roslyn
+          git clone --depth 1 https://github.com/TheAlgorithms/C-Sharp.git CSharp/TheAlgorithms-CSharp
+          git clone --depth 1 https://github.com/dotnet/aspnetcore.git CSharp/aspnetcore
+          git clone --depth 1 https://github.com/dotnet/efcore.git CSharp/efcore
+          git clone --depth 1 https://github.com/mono/mono.git CSharp/mono
+        continue-on-error: true
+
+      - name: Clone Ruby Repositories
+        run: |
+          git clone --depth 1 https://github.com/ruby/ruby.git Ruby/ruby
+          git clone --depth 1 https://github.com/rails/rails.git Ruby/rails
+          git clone --depth 1 https://github.com/jekyll/jekyll.git Ruby/jekyll
+          git clone --depth 1 https://github.com/sinatra/sinatra.git Ruby/sinatra
+          git clone --depth 1 https://github.com/rspec/rspec-core.git Ruby/rspec-core
+        continue-on-error: true
+
+      - name: Clone JavaScript Repositories
+        run: |
+          git clone --depth 1 https://github.com/v8/v8.git JavaScript/v8
+          git clone --depth 1 https://github.com/TheAlgorithms/JavaScript.git JavaScript/TheAlgorithms-JavaScript
+          git clone --depth 1 https://github.com/facebook/react.git JavaScript/react
+          git clone --depth 1 https://github.com/nodejs/node.git JavaScript/node
+          git clone --depth 1 https://github.com/expressjs/express.git JavaScript/express
+        continue-on-error: true
+
+      - name: Clone TypeScript Repositories
+        run: |
+          git clone --depth 1 https://github.com/microsoft/TypeScript.git TypeScript/TypeScript
+          git clone --depth 1 https://github.com/TheAlgorithms/TypeScript.git TypeScript/TheAlgorithms-TypeScript
+          git clone --depth 1 https://github.com/angular/angular.git TypeScript/angular
+          git clone --depth 1 https://github.com/denoland/deno.git TypeScript/deno
+          git clone --depth 1 https://github.com/nestjs/nest.git TypeScript/nest
+        continue-on-error: true
+
+      - name: List Cloned Repositories
+        run: |
+          find . -type d -maxdepth 2 | grep -v "^./.git"
+
+      - name: Upload Cloned Repositories as Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloned-repositories
+          path: |
+            Swift/
+            Python/
+            Lua/
+            C/
+            Cpp/
+            ObjectiveC/
+            CSharp/
+            Ruby/
+            JavaScript/
+            TypeScript/
+          retention-days: 1
