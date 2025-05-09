@@ -1,4 +1,4 @@
-name: Clone Programming Language Repositories
+name: Clone All Programming and Development Repositories
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
 
       - name: Set Up Workspace
         run: |
-          mkdir -p Swift Python Lua C Cpp ObjectiveC CSharp Ruby JavaScript TypeScript
+          mkdir -p Swift Python Lua C Cpp ObjectiveC CSharp Ruby JavaScript TypeScript Roblox iOS Flask AI Dylibs IPA Files
 
       - name: Clone Swift Repositories
         run: |
@@ -108,6 +108,53 @@ jobs:
           git clone --depth 1 https://github.com/nestjs/nest.git TypeScript/nest
         continue-on-error: true
 
+      - name: Clone Roblox Repositories
+        run: |
+          git clone --depth 1 https://github.com/Roblox/rojo.git Roblox/rojo
+          git clone --depth 1 https://github.com/Roblox/luau.git Roblox/luau
+        continue-on-error: true
+
+      - name: Clone iOS Repositories
+        run: |
+          git clone --depth 1 https://github.com/Alamofire/Alamofire.git iOS/Alamofire
+          git clone --depth 1 https://github.com/SDWebImage/SDWebImage.git iOS/SDWebImage
+        continue-on-error: true
+
+      - name: Clone Flask Repositories
+        run: |
+          git clone --depth 1 https://github.com/pallets/flask.git Flask/flask
+          git clone --depth 1 https://github.com/miguelgrinberg/flasky.git Flask/flasky
+        continue-on-error: true
+
+      - name: Clone AI Repositories
+        run: |
+          git clone --depth 1 https://github.com/tensorflow/tensorflow.git AI/tensorflow
+          git clone --depth 1 https://github.com/huggingface/transformers.git AI/transformers
+        continue-on-error: true
+
+      - name: Clone Dylibs Repositories
+        run: |
+          git clone --depth 1 https://github.com/facebook/fishhook.git Dylibs/fishhook
+          git clone --depth 1 https://github.com/theos/theos.git Dylibs/theos
+        continue-on-error: true
+
+      - name: Clone IPA Repositories
+        run: |
+          git clone --depth 1 https://github.com/AloneMonkey/frida-ios-dump.git IPA/frida-ios-dump
+          git clone --depth 1 https://github.com/dpogue/ipa_repackager.git IPA/ipa_repackager
+        continue-on-error: true
+
+      - name: Clone Files Repositories
+        run: |
+          git clone --depth 1 https://github.com/libarchive/libarchive.git Files/libarchive
+          git clone --depth 1 https://github.com/file/file.git Files/file
+        continue-on-error: true
+
+      - name: Create .artifactignore File
+        run: |
+          echo "ObjectiveC/CocoaPods/spec/fixtures/**" > .artifactignore
+          echo "ObjectiveC/CocoaPods/spec/fixtures/Project[With]Special{chars}in*path?/**" >> .artifactignore
+
       - name: List Cloned Repositories
         run: |
           find . -type d -maxdepth 2 | grep -v "^./.git"
@@ -127,4 +174,11 @@ jobs:
             Ruby/
             JavaScript/
             TypeScript/
+            Roblox/
+            iOS/
+            Flask/
+            AI/
+            Dylibs/
+            IPA/
+            Files/
           retention-days: 1
