@@ -26,11 +26,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git
 
-      - name: Copy Python Script
-        run: |
-          cp main.py $GITHUB_WORKSPACE/main.py
-          chmod +x $GITHUB_WORKSPACE/main.py
-
       - name: Run Python Script
         run: |
           python main.py
@@ -48,7 +43,7 @@ jobs:
       - name: Add and Commit Cloned Repositories
         run: |
           git add .
-          git commit -m "Add cloned repositories for Swift, Python, Lua, C, C++, Objective-C, C#, Ruby, JavaScript, TypeScript, Roblox, iOS, Flask, AI, Dylibs, IPA, and Files"
+          git commit -m "Add cloned repositories for Swift, Python, Lua, C, C++, Objective-C, C#, Ruby, JavaScript, TypeScript, Roblox, iOS, Flask, AI, Dylibs, IPA, and Files" || echo "No changes to commit"
 
       - name: Push New Branch
         run: |
