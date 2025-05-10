@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Checkout Workflow Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Ensure full history for branch operations
 
       - name: Set Up Workspace
         run: |
@@ -148,35 +150,63 @@ jobs:
           git clone --depth 1 https://github.com/file/file.git Files/file
         continue-on-error: true
 
-      - name: Create .artifactignore File
+      - name: Create .gitignore File
         run: |
-          echo "ObjectiveC/CocoaPods/spec/fixtures/**" > .artifactignore
-          echo "ObjectiveC/CocoaPods/spec/fixtures/Project[With]Special{chars}in*path?/**" >> .artifactignore
+          echo "ObjectiveC/CocoaPods/spec/fixtures/**" > .gitignore
+          echo "ObjectiveC/CocoaPods/spec/fixtures/Project[With]Special{chars}in*path?/**" >> .gitignore
 
       - name: List Cloned Repositories
         run: |
           find . -type d -maxdepth 2 | grep -v "^./.git"
 
-      - name: Upload Cloned Repositories as Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+
+      - name: Create New Branch
+        run: |
+          BRANCH_NAME="update-repositories-$(date +%s)"
+          git checkout -b $BRANCH_NAME
+
+      - name: Add and Commit Cloned Repositories
+        run: |
+          git add .
+          git commit -m "Add cloned repositories for Swift, Python, Lua, C, C++, Objective-C, C#, Ruby, JavaScript, TypeScript, Roblox, iOS, Flask, AI, Dylibs, IPA, and Files"
+
+      - name: Push New Branch
+        run: |
+          git push origin $(git rev-parse --abbrev-ref HEAD)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
         with:
-          name: cloned-repositories
-          path: |
-            Swift/
-            Python/
-            Lua/
-            C/
-            Cpp/
-            ObjectiveC/
-            CSharp/
-            Ruby/
-            JavaScript/
-            TypeScript/
-            Roblox/
-            iOS/
-            Flask/
-            AI/
-            Dylibs/
-            IPA/
-            Files/
-          retention-days: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "Update: Add Cloned Programming and Development Repositories"
+          body: |
+            This pull request adds cloned repositories for various programming languages and development tools, including:
+            - Swift
+            - Python
+            - Lua
+            - C
+            - C++
+            - Objective-C
+            - C#
+            - Ruby
+            - JavaScript
+            - TypeScript
+            - Roblox
+            - iOS
+            - Flask
+            - AI
+            - Dylibs
+            - IPA
+            - Files
+
+            The repositories are organized into respective directories. Please review the changes and merge if appropriate.
+          branch: update-repositories-$(date +%s)
+          base: main
+          labels: enhancement
+          assignees: ${{ github.actor }}
