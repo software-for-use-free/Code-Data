@@ -1,4 +1,4 @@
-name: Clone All Programming and Development Repositories
+name: Run Python Script to Clone Repositories
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  clone-repositories:
+  run-clone-script:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,148 +16,24 @@ jobs:
         with:
           fetch-depth: 0  # Ensure full history for branch operations
 
-      - name: Set Up Workspace
-        run: |
-          mkdir -p Swift Python Lua C Cpp ObjectiveC CSharp Ruby JavaScript TypeScript Roblox iOS Flask AI Dylibs IPA Files
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'  # Use the latest Python 3.x version
 
-      - name: Clone Swift Repositories
+      - name: Install Git
         run: |
-          git clone --depth 1 https://github.com/apple/swift.git Swift/swift
-          git clone --depth 1 https://github.com/TheAlgorithms/Swift.git Swift/TheAlgorithms-Swift
-          git clone --depth 1 https://github.com/Alamofire/Alamofire.git Swift/Alamofire
-          git clone --depth 1 https://github.com/SwiftPackageIndex/SwiftPackageIndex.git Swift/SwiftPackageIndex
-          git clone --depth 1 https://github.com/onmyway133/SwiftUI-Examples.git Swift/SwiftUI-Examples
-        continue-on-error: true
+          sudo apt-get update
+          sudo apt-get install -y git
 
-      - name: Clone Python Repositories
+      - name: Copy Python Script
         run: |
-          git clone --depth 1 https://github.com/python/cpython.git Python/cpython
-          git clone --depth 1 https://github.com/TheAlgorithms/Python.git Python/TheAlgorithms-Python
-          git clone --depth 1 https://github.com/django/django.git Python/django
-          git clone --depth 1 https://github.com/pallets/flask.git Python/flask
-          git clone --depth 1 https://github.com/numpy/numpy.git Python/numpy
-        continue-on-error: true
+          cp main.py $GITHUB_WORKSPACE/main.py
+          chmod +x $GITHUB_WORKSPACE/main.py
 
-      - name: Clone Lua Repositories
+      - name: Run Python Script
         run: |
-          git clone --depth 1 https://github.com/lua/lua.git Lua/lua
-          git clone --depth 1 https://github.com/LuaDist/lua.git Lua/LuaDist-lua
-          git clone --depth 1 https://github.com/luvit/luvit.git Lua/luvit
-          git clone --depth 1 https://github.com/luarocks/luarocks.git Lua/luarocks
-          git clone --depth 1 https://github.com/love2d/love.git Lua/love
-        continue-on-error: true
-
-      - name: Clone C Repositories
-        run: |
-          git clone --depth 1 https://github.com/gcc-mirror/gcc.git C/gcc
-          git clone --depth 1 https://github.com/llvm/llvm-project.git C/llvm-project
-          git clone --depth 1 https://github.com/TheAlgorithms/C.git C/TheAlgorithms-C
-          git clone --depth 1 https://github.com/torvalds/linux.git C/linux
-          git clone --depth 1 https://github.com/sqlite/sqlite.git C/sqlite
-        continue-on-error: true
-
-      - name: Clone C++ Repositories
-        run: |
-          git clone --depth 1 https://github.com/gcc-mirror/gcc.git Cpp/gcc
-          git clone --depth 1 https://github.com/llvm/llvm-project.git Cpp/llvm-project
-          git clone --depth 1 https://github.com/TheAlgorithms/C-Plus-Plus.git Cpp/TheAlgorithms-Cpp
-          git clone --depth 1 https://github.com/boostorg/boost.git Cpp/boost
-          git clone --depth 1 https://github.com/opencv/opencv.git Cpp/opencv
-        continue-on-error: true
-
-      - name: Clone Objective-C Repositories
-        run: |
-          git clone --depth 1 https://github.com/llvm/llvm-project.git ObjectiveC/llvm-project
-          git clone --depth 1 https://github.com/AFNetworking/AFNetworking.git ObjectiveC/AFNetworking
-          git clone --depth 1 https://github.com/SnapKit/Masonry.git ObjectiveC/Masonry
-        continue-on-error: true
-
-      - name: Clone C# Repositories
-        run: |
-          git clone --depth 1 https://github.com/dotnet/roslyn.git CSharp/roslyn
-          git clone --depth 1 https://github.com/TheAlgorithms/C-Sharp.git CSharp/TheAlgorithms-CSharp
-          git clone --depth 1 https://github.com/dotnet/aspnetcore.git CSharp/aspnetcore
-          git clone --depth 1 https://github.com/dotnet/efcore.git CSharp/efcore
-          git clone --depth 1 https://github.com/mono/mono.git CSharp/mono
-        continue-on-error: true
-
-      - name: Clone Ruby Repositories
-        run: |
-          git clone --depth 1 https://github.com/ruby/ruby.git Ruby/ruby
-          git clone --depth 1 https://github.com/rails/rails.git Ruby/rails
-          git clone --depth 1 https://github.com/jekyll/jekyll.git Ruby/jekyll
-          git clone --depth 1 https://github.com/sinatra/sinatra.git Ruby/sinatra
-          git clone --depth 1 https://github.com/rspec/rspec-core.git Ruby/rspec-core
-        continue-on-error: true
-
-      - name: Clone JavaScript Repositories
-        run: |
-          git clone --depth 1 https://github.com/v8/v8.git JavaScript/v8
-          git clone --depth 1 https://github.com/TheAlgorithms/JavaScript.git JavaScript/TheAlgorithms-JavaScript
-          git clone --depth 1 https://github.com/facebook/react.git JavaScript/react
-          git clone --depth 1 https://github.com/nodejs/node.git JavaScript/node
-          git clone --depth 1 https://github.com/expressjs/express.git JavaScript/express
-        continue-on-error: true
-
-      - name: Clone TypeScript Repositories
-        run: |
-          git clone --depth 1 https://github.com/microsoft/TypeScript.git TypeScript/TypeScript
-          git clone --depth 1 https://github.com/TheAlgorithms/TypeScript.git TypeScript/TheAlgorithms-TypeScript
-          git clone --depth 1 https://github.com/angular/angular.git TypeScript/angular
-          git clone --depth 1 https://github.com/denoland/deno.git TypeScript/deno
-          git clone --depth 1 https://github.com/nestjs/nest.git TypeScript/nest
-        continue-on-error: true
-
-      - name: Clone Roblox Repositories
-        run: |
-          git clone --depth 1 https://github.com/Roblox/rojo.git Roblox/rojo
-          git clone --depth 1 https://github.com/Roblox/luau.git Roblox/luau
-        continue-on-error: true
-
-      - name: Clone iOS Repositories
-        run: |
-          git clone --depth 1 https://github.com/Alamofire/Alamofire.git iOS/Alamofire
-          git clone --depth 1 https://github.com/SDWebImage/SDWebImage.git iOS/SDWebImage
-        continue-on-error: true
-
-      - name: Clone Flask Repositories
-        run: |
-          git clone --depth 1 https://github.com/pallets/flask.git Flask/flask
-          git clone --depth 1 https://github.com/miguelgrinberg/flasky.git Flask/flasky
-        continue-on-error: true
-
-      - name: Clone AI Repositories
-        run: |
-          git clone --depth 1 https://github.com/tensorflow/tensorflow.git AI/tensorflow
-          git clone --depth 1 https://github.com/huggingface/transformers.git AI/transformers
-        continue-on-error: true
-
-      - name: Clone Dylibs Repositories
-        run: |
-          git clone --depth 1 https://github.com/facebook/fishhook.git Dylibs/fishhook
-          git clone --depth 1 https://github.com/theos/theos.git Dylibs/theos
-        continue-on-error: true
-
-      - name: Clone IPA Repositories
-        run: |
-          git clone --depth 1 https://github.com/AloneMonkey/frida-ios-dump.git IPA/frida-ios-dump
-          git clone --depth 1 https://github.com/dpogue/ipa_repackager.git IPA/ipa_repackager
-        continue-on-error: true
-
-      - name: Clone Files Repositories
-        run: |
-          git clone --depth 1 https://github.com/libarchive/libarchive.git Files/libarchive
-          git clone --depth 1 https://github.com/file/file.git Files/file
-        continue-on-error: true
-
-      - name: Create .gitignore File
-        run: |
-          echo "ObjectiveC/CocoaPods/spec/fixtures/**" > .gitignore
-          echo "ObjectiveC/CocoaPods/spec/fixtures/Project[With]Special{chars}in*path?/**" >> .gitignore
-
-      - name: List Cloned Repositories
-        run: |
-          find . -type d -maxdepth 2 | grep -v "^./.git"
+          python main.py
 
       - name: Configure Git
         run: |
@@ -205,7 +81,7 @@ jobs:
             - IPA
             - Files
 
-            The repositories are organized into respective directories. Please review the changes and merge if appropriate.
+            The repositories are organized into respective directories by the main.py script. Please review the changes and merge if appropriate.
           branch: update-repositories-$(date +%s)
           base: main
           labels: enhancement
