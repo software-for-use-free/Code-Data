@@ -68,8 +68,6 @@ jobs:
           git clone --depth 1 https://github.com/llvm/llvm-project.git ObjectiveC/llvm-project
           git clone --depth 1 https://github.com/AFNetworking/AFNetworking.git ObjectiveC/AFNetworking
           git clone --depth 1 https://github.com/SnapKit/Masonry.git ObjectiveC/Masonry
-          git clone --depth 1 https://github.com/CocoaPods/CocoaPods.git ObjectiveC/CocoaPods
-          git clone --depth 1 https://github.com/realm/realm-cocoa.git ObjectiveC/realm-cocoa
         continue-on-error: true
 
       - name: Clone C# Repositories
