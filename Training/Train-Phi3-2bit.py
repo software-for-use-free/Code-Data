@@ -45,6 +45,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig
 )
+from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 # Import AQLM for 2-bit quantization
 try:
