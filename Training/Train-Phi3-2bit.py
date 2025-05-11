@@ -19,7 +19,7 @@
 
 # %%
 # Install required libraries
-# !pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
+!pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
 # Set PyTorch memory management environment variables to avoid fragmentation
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
