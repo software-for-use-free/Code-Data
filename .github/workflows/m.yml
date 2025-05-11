@@ -16,4 +16,51 @@ jobs:
           curl -X POST https://model-4w5ry0rq.api.baseten.co/environments/production/predict \
             -H "Authorization: Api-Key AZ4SysEB.ZbdIOxwp2PdFFbGO6sNG29chOp9GHFzy" \
             -H "Content-Type: application/json" \
-            -d '{"messages": [{"role": "user", "content": "Generate A Swift Dataset For Training Models With 10,000 Examples"}], "max_tokens": 1000000}'
+            -d '{"messages": [{"role": "user", "content": "Objective: Create a comprehensive dataset containing 10,000 unique Swift code examples, each demonstrating a distinct piece of iOS app functionality, suitable for training machine learning models to understand, generate, or analyze iOS app code.
+Dataset Requirements:
+1.  Language: All code must be written in Swift (latest stable version, e.g., Swift 5.10 as of May 2025).
+2.  Quantity: Exactly 10,000 examples.
+3.  Content:
+	•  Each example should be a self-contained Swift code snippet showcasing a specific iOS app functionality.
+	•  Examples should cover a wide range of iOS development topics, including but not limited to:
+		•  UIKit: View controllers, buttons, labels, text fields, table views, collection views, navigation controllers.
+		•  SwiftUI: Views, modifiers, state management, navigation, animations, data binding.
+		•  Networking: HTTP requests (GET, POST), JSON parsing, URLSession, async/await.
+		•  Core Data: CRUD operations, entity management, fetch requests.
+		•  User Interface: Alerts, action sheets, gestures, animations, custom views.
+		•  Location Services: Geolocation, map integration, region monitoring.
+		•  Notifications: Push notifications, local notifications, notification handling.
+		•  Authentication: Sign-in with Apple, biometric authentication (Face ID/Touch ID).
+		•  Media: Camera, photo library, audio playback, video playback.
+		•  Persistence: UserDefaults, file management, keychain.
+		•  Concurrency: Async/await, actors, dispatch queues.
+		•  Accessibility: VoiceOver support, dynamic type, accessibility labels.
+		•  Widgets: iOS widget creation and configuration.
+		•  Machine Learning: Core ML model integration, Vision framework.
+		•  Augmented Reality: ARKit scenes, object placement.
+	•  Code snippets should range in complexity (beginner to advanced) to ensure diversity.
+4.  Structure:
+	•  Each example should include:
+		•  Code: A functional Swift code snippet (e.g., a function, struct, class, or view).
+		•  Description: A brief comment or metadata explaining the functionality (e.g., “Displays a UITableView with custom cells”).
+		•  Category: The iOS topic it belongs to (e.g., UIKit, SwiftUI, Networking).
+		•  Input/Output: If applicable, example inputs and expected outputs (e.g., for networking, show sample JSON response).
+	•  Snippets should be concise (50–300 lines) but complete enough to demonstrate the functionality.
+5.  Diversity:
+	•  Avoid repetitive examples; ensure variety in functionality, UI components, and APIs used.
+	•  Include both UIKit and SwiftUI implementations where applicable (e.g., a table view in UIKit and a List in SwiftUI).
+	•  Cover different iOS versions (e.g., iOS 16, 17, 18 features) and handle deprecated APIs appropriately.
+6.  Format:
+	•  Store the dataset in a structured format (e.g., JSON, CSV, or SQLite) with fields for:
+		•  Example ID (unique identifier).
+		•  Code snippet (as a string).
+		•  Description (string).
+		•  Category (string).
+		•  Tags (array of relevant keywords, e.g., [“tableview”, “uikit”, “datasource”]).
+		•  Complexity level (beginner, intermediate, advanced).
+	•  Ensure the dataset is machine-readable and well-documented for training purposes.
+7.  Quality:
+	•  Code must be syntactically correct, follow Swift best practices, and be executable in an iOS environment (Xcode 16 or later).
+	•  Include error handling where relevant (e.g., try-catch for networking).
+	•  Adhere to Apple’s Human Interface Guidelines for UI-related code.
+	•  Avoid using third-party libraries; use only iOS native frameworks (e.g., UIKit, SwiftUI, Foundation)."}], "max_tokens": 1000000}'
