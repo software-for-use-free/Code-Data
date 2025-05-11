@@ -15,4 +15,5 @@ jobs:
         run: |
           curl -X POST https://model-4w5ry0rq.api.baseten.co/environments/production/predict \
             -H "Authorization: Api-Key AZ4SysEB.ZbdIOxwp2PdFFbGO6sNG29chOp9GHFzy" \
-            -d '"hello how are you"'
+            -H "Content-Type: application/json" \
+            -d '{"text": "hello how are you", "max_tokens": 100}'
