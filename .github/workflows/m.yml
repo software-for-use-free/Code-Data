@@ -16,4 +16,4 @@ jobs:
           curl -X POST https://model-4w5ry0rq.api.baseten.co/environments/production/predict \
             -H "Authorization: Api-Key AZ4SysEB.ZbdIOxwp2PdFFbGO6sNG29chOp9GHFzy" \
             -H "Content-Type: application/json" \
-            -d '{"messages": [{"role": "user", "content": "hello how are you"}], "max_tokens": 100}'
+            -d '{"messages": [{"role": "user", "content": "Generate A Swift Dataset For Training Models With 10,000 Examples"}], "max_tokens": 100}'
