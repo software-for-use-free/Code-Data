@@ -1,0 +1,27 @@
+name: Send Message to FastAPI Endpoint
+
+on:
+  workflow_dispatch: # Allows manual triggering
+  push:
+    branches:
+      - main # Triggers on push to main branch
+
+jobs:
+  send-message:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Send POST request to FastAPI endpoint
+        run: |
+          curl -X POST "https://6159-35-237-132-22.ngrok-free.app/generate" \
+            -H "Content-Type: application/json" \
+            -d '{"prompt": "hello how are", "max_length": 100, "temperature": 0.7, "top_p": 0.9}' \
+            | tee response.json
+        continue-on-error: true # Continue even if the request fails (e.g., ngrok URL expired)
+
+      - name: Display response
+        run: |
+          cat response.json
