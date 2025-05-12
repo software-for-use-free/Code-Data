@@ -912,7 +912,7 @@ try:
         
         # Distributed training parameters
         local_rank=int(os.environ.get("LOCAL_RANK", -1)),  # For distributed training
-        ddp_find_unused_parameters=False,                  # Optimize DDP
+        ddp_find_unused_parameters=True,                   # Required for Phi-3 models in multi-GPU setup
         ddp_bucket_cap_mb=50,                             # Limit communication buffer size
         dataloader_num_workers=1,                          # Reduced from 4 to save memory
         dataloader_prefetch_factor=2,                      # Limit prefetching to save memory
@@ -1452,6 +1452,26 @@ print("Setting up memory-optimized trainer...")
 # Add additional memory optimization callbacks
 from transformers.trainer_callback import TrainerCallback
 
+class OOMGuardCallback(TrainerCallback):
+    """Custom callback that detects and prevents OOM errors"""
+    def on_step_end(self, args, state, control, **kwargs):
+        # Check memory usage on each GPU after step
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / torch.cuda.get_device_properties(i).total_memory
+            if allocated > 0.92:  # Over 92% memory usage
+                # Force immediate garbage collection and cache clearing
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"\n⚠️ Warning: GPU {i} memory usage high ({allocated*100:.1f}%). Forcing cache clear.")
+                # Pause briefly to allow memory release
+                time.sleep(1)
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        # Clean up between epochs for better stability
+        gc.collect()
+        torch.cuda.empty_cache()
+        return control
+
 class MemoryOptimizationCallback(TrainerCallback):
     """Custom callback to optimize memory usage during training."""
     
@@ -1460,15 +1480,38 @@ class MemoryOptimizationCallback(TrainerCallback):
         # Free memory every few steps
         if state.global_step % 10 == 0:
             cleanup_memory()
+            
+            # Monitor GPU memory usage every 100 steps
+            if state.global_step % 100 == 0:
+                print(f"\n--- Memory status at step {state.global_step} ---")
+                if torch.cuda.is_available():
+                    for i in range(torch.cuda.device_count()):
+                        allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                        reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                        print(f"GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                
+                # Also monitor CPU memory
+                process = psutil.Process(os.getpid())
+                memory_info = process.memory_info()
+                print(f"CPU memory: {memory_info.rss / (1024**3):.2f}GB")
+        
         return control
     
     def on_evaluate(self, args, state, control, **kwargs):
         """Run before evaluation begins."""
+        print("\nRunning memory cleanup before evaluation...")
         cleanup_memory()
         return control
     
     def on_save(self, args, state, control, **kwargs):
         """Run before model is saved."""
+        print("\nRunning memory cleanup before saving model...")
+        cleanup_memory()
+        return control
+        
+    def on_epoch_end(self, args, state, control, **kwargs):
+        """Run at the end of each epoch."""
+        print(f"\nCompleted epoch. Running thorough memory cleanup...")
         cleanup_memory()
         return control
 
@@ -1482,7 +1525,8 @@ trainer = Trainer(
     data_collator=data_collator,
     callbacks=[
         early_stopping_callback,
-        MemoryOptimizationCallback()
+        MemoryOptimizationCallback(),
+        OOMGuardCallback()
     ]
 )
 
