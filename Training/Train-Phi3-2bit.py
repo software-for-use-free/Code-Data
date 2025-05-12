@@ -53,10 +53,16 @@ print("Starting Phi-3 training pipeline...")
 print("📦 Installing required libraries...")
 !pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
 
-# Set PyTorch memory management environment variables to avoid fragmentation
+# Set PyTorch memory management environment variables to avoid fragmentation and OOM issues
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Configure CUDA memory allocation for better memory management
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Explicitly set to use 2 GPUs
+# Enable better memory handling with CPU offloading
+os.environ["ACCELERATE_USE_CPU_OFFLOAD"] = "1"
+os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
+# Enable disk offloading if needed
+os.environ["ACCELERATE_ENABLE_DISK_OFFLOAD"] = "1"
 
 # Update execution status
 if 'update_status' in globals():
@@ -73,7 +79,9 @@ import collections
 import psutil
 import os
 import gc
+import sys
 import json
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM, 
@@ -101,14 +109,38 @@ except Exception as e:
     print(f"Error importing AQLM: {e}")
     print("Will fallback to 4-bit quantization using BitsAndBytes")
 
-# Define memory cleanup function
+# Define enhanced memory cleanup function
 def cleanup_memory():
-    """Clean up GPU memory to avoid fragmentation."""
-    print("Cleaning up memory...")
+    """Clean up GPU memory to avoid fragmentation with aggressive memory management."""
+    print("Cleaning up memory with enhanced strategies...")
+    # Clear Python's garbage collector
     gc.collect()
+    
     if torch.cuda.is_available():
+        # Empty CUDA cache
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        
+        # Additional GPU memory cleanup steps
+        for i in range(torch.cuda.device_count()):
+            # Force deallocate any unused memory
+            if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+                torch.cuda.reset_peak_memory_stats(i)
+            
+            # Print memory info after cleanup
+            if hasattr(torch.cuda, 'memory_allocated'):
+                alloc = torch.cuda.memory_allocated(i) / (1024**3)
+                reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                print(f"  GPU {i} after cleanup: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved")
+        
+    # Explicitly delete any large objects that might be in memory
+    large_objects = [var for var in globals() if isinstance(globals()[var], (torch.Tensor, dict, list)) and sys.getsizeof(globals()[var]) > 1e6]
+    for obj in large_objects:
+        print(f"  Deleting large object: {obj}")
+        del globals()[obj]
+    
+    # Run gc again
+    gc.collect()
         
 # Define resource monitoring function
 def monitor_resources():
@@ -173,27 +205,37 @@ DATASET_ID = "mvasiliniuc/iva-swift-codeint"
 # Model configuration - using Phi-3-mini-128k-instruct
 MODEL_NAME = "microsoft/Phi-3-mini-128k-instruct"
 MAX_LENGTH = 4096  # Phi-3 can handle long sequences natively
-BATCH_SIZE = 2  # Reduced batch size for multi-GPU training (each GPU will process this batch size)
+BATCH_SIZE = 1  # Reduced batch size to 1 to minimize memory usage per GPU
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 3
 WARMUP_RATIO = 0.03
-GRADIENT_ACCUMULATION_STEPS = 4  # Reduced since we're using 2 GPUs
+GRADIENT_ACCUMULATION_STEPS = 8  # Increased gradient accumulation to compensate for smaller batch size
 
 # LoRA configuration
-LORA_R = 16
-LORA_ALPHA = 32
+LORA_R = 8  # Reduced from 16 to save memory
+LORA_ALPHA = 16  # Reduced from 32 to save memory
 LORA_DROPOUT = 0.05
 
 # Debug mode for testing with smaller dataset
 DEBUG_MODE = True
 DEBUG_SAMPLE_SIZE = 100
 
+# Memory optimization flags
+USE_CPU_OFFLOAD = True
+USE_MEMORY_EFFICIENT_ATTENTION = True
+USE_ACTIVATION_CHECKPOINTING = True
+USE_SEQUENTIAL_OFFLOAD = True
+OFFLOAD_FOLDER = "./offload_folder"  # For disk offloading
+os.makedirs(OFFLOAD_FOLDER, exist_ok=True)
+
 print(f"Using model: {MODEL_NAME}")
 print(f"Max sequence length: {MAX_LENGTH}")
 print(f"Batch size: {BATCH_SIZE} per device")
+print(f"Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}")
 print(f"Effective batch size: {BATCH_SIZE * (2 if torch.cuda.device_count() > 1 else 1) * GRADIENT_ACCUMULATION_STEPS}")
 print(f"LoRA rank: {LORA_R}")
+print(f"Memory optimizations: CPU Offload={USE_CPU_OFFLOAD}, Memory-Efficient Attention={USE_MEMORY_EFFICIENT_ATTENTION}")
 
 
 # %%
@@ -668,7 +710,7 @@ try:
     # Create output directory if it doesn't exist
     os.makedirs("./phi3_swift_model", exist_ok=True)
     
-    # Configure training arguments with distributed training settings
+    # Configure training arguments with enhanced memory optimizations for multi-GPU training
     training_args = TrainingArguments(
         output_dir="./phi3_swift_model",
         num_train_epochs=NUM_EPOCHS,
@@ -685,13 +727,25 @@ try:
         eval_strategy="steps",
         eval_steps=500,
         load_best_model_at_end=True,
-        fp16=True,  # Use mixed precision training
+        
+        # Memory optimization settings
+        fp16=True,                    # Use mixed precision training
+        bf16=False,                   # Don't use bfloat16 (T4 GPUs don't support it)
         gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
+        optim="adamw_torch_fused",    # Use memory-efficient fused optimizer
+        
+        # Advanced memory settings
+        max_grad_norm=0.3,            # Reduce gradient norm for stability
+        group_by_length=True,         # Group sequences of similar length to reduce padding
+        dataloader_pin_memory=False,  # Disable pinning memory for less RAM usage
+        
         # Distributed training parameters
         local_rank=int(os.environ.get("LOCAL_RANK", -1)),  # For distributed training
-        ddp_find_unused_parameters=False,  # Optimize DDP
-        dataloader_num_workers=4,  # Parallelize data loading
-        report_to="none",  # Disable reporting to avoid extra overhead
+        ddp_find_unused_parameters=False,                  # Optimize DDP
+        ddp_bucket_cap_mb=50,                             # Limit communication buffer size
+        dataloader_num_workers=1,                          # Reduced from 4 to save memory
+        dataloader_prefetch_factor=2,                      # Limit prefetching to save memory
+        report_to="none",                                  # Disable reporting to avoid overhead
     )
     
     print(f"Training arguments configured for {'multi-GPU' if torch.cuda.device_count() > 1 else 'single-GPU'} training")
@@ -754,18 +808,74 @@ try:
         # Use AQLM's correct approach for 2-bit quantization
         print(f"Using AQLM for {QUANT_BITS}-bit quantization...")
         
-        # First load the model normally - we'll apply AQLM quantization after
-        print(f"Loading base model {MODEL_NAME}...")
+        # First load the model with empty weights to save memory
+        print(f"Loading base model {MODEL_NAME} with CPU offloading and memory optimizations...")
         
-        # For GPU or CPU
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch.float16,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            use_cache=False,  # Disable KV cache during training for better memory efficiency
-            low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
-        )
+        # For GPU or CPU with advanced memory management
+        if USE_CPU_OFFLOAD:
+            print("Using CPU offloading to reduce GPU memory usage...")
+            
+            # First initialize with empty weights to avoid OOM during loading
+            with init_empty_weights():
+                config = AutoModelForCausalLM.from_pretrained(
+                    MODEL_NAME, 
+                    trust_remote_code=True,
+                    return_dict=True
+                )
+                # Add memory-efficient attention method to config
+                if USE_MEMORY_EFFICIENT_ATTENTION and hasattr(config, "attention_implementation"):
+                    print("Enabling memory-efficient attention...")
+                    config.attention_implementation = "flash_attention_2"
+            
+            # Then load the checkpoint directly to the appropriate devices with offloading
+            print("Loading checkpoint with weight offloading...")
+            offload_folder = OFFLOAD_FOLDER if USE_SEQUENTIAL_OFFLOAD else None
+            
+            # Create maximum offload configuration for disk offloading
+            device_map = {
+                "model.embed_tokens": 0,  # Keep embeddings on GPU 0
+                "model.norm": 0,          # Keep normalization on GPU 0
+                "lm_head": 0,             # Keep LM head on GPU 0
+            }
+            
+            # Distribute layers across devices with CPU/disk offloading
+            n_layers = config.num_hidden_layers
+            gpu0_layers = n_layers // 4      # 25% on GPU 0
+            gpu1_layers = n_layers // 4      # 25% on GPU 1
+            cpu_layers = n_layers - gpu0_layers - gpu1_layers  # Rest on CPU with potential disk offload
+            
+            # Assign layers to devices
+            for i in range(n_layers):
+                if i < gpu0_layers:
+                    device_map[f"model.layers.{i}"] = 0
+                elif i < gpu0_layers + gpu1_layers:
+                    device_map[f"model.layers.{i}"] = 1
+                else:
+                    device_map[f"model.layers.{i}"] = "cpu"
+            
+            print(f"Device map: GPU 0: {gpu0_layers} layers, GPU 1: {gpu1_layers} layers, CPU: {cpu_layers} layers")
+            
+            # Load with offloading to CPU/disk
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                device_map=device_map,
+                offload_folder=offload_folder,
+                offload_state_dict=True,  # Enable state dict offloading
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                use_cache=False,  # Disable KV cache during training
+                attn_implementation="eager" if not USE_MEMORY_EFFICIENT_ATTENTION else "flash_attention_2"
+            )
+        else:
+            # Standard loading with basic memory optimization
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                torch_dtype=torch.float16,
+                device_map="auto" if torch.cuda.is_available() else None,
+                trust_remote_code=True,
+                use_cache=False,  # Disable KV cache during training for better memory efficiency
+                low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+            )
         
         # Now apply AQLM 2-bit quantization to the model
         print(f"Applying AQLM {QUANT_BITS}-bit quantization...")
@@ -842,39 +952,129 @@ except Exception as e:
     QUANT_BITS = 4
     USING_AQLM = False
     
-    # Configure BitsAndBytes for 4-bit quantization
+    # Enhanced BitsAndBytes 4-bit quantization with memory optimizations
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype_for_cpu_offload=torch.float32,
     )
     
-    # Load model for GPU or CPU
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        quantization_config=bnb_config,
-        device_map="auto" if torch.cuda.is_available() else None,
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-        use_cache=False
-    )
+    # Load model for GPU or CPU with memory optimizations
+    if USE_CPU_OFFLOAD:
+        print("Using CPU offloading with BitsAndBytes quantization...")
+        
+        # First initialize with empty weights to avoid OOM during loading
+        with init_empty_weights():
+            config = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME, 
+                trust_remote_code=True,
+                return_dict=True
+            )
+            # Add memory-efficient attention method to config if available
+            if USE_MEMORY_EFFICIENT_ATTENTION and hasattr(config, "attention_implementation"):
+                print("Enabling memory-efficient attention...")
+                config.attention_implementation = "flash_attention_2"
+        
+        # Custom device map for aggressive offloading
+        offload_folder = OFFLOAD_FOLDER if USE_SEQUENTIAL_OFFLOAD else None
+        
+        # Create custom device map for offloading
+        device_map = {
+            "model.embed_tokens": 0,  # Keep embeddings on GPU 0
+            "model.norm": 0,          # Keep normalization on GPU 0
+            "lm_head": 0,             # Keep LM head on GPU 0
+        }
+        
+        # Distribute layers across devices with CPU/disk offloading
+        n_layers = config.num_hidden_layers
+        gpu0_layers = n_layers // 3   # 33% on GPU 0
+        gpu1_layers = n_layers // 3   # 33% on GPU 1
+        cpu_layers = n_layers - gpu0_layers - gpu1_layers  # 34% on CPU with potential disk offload
+        
+        # Assign layers to devices
+        for i in range(n_layers):
+            if i < gpu0_layers:
+                device_map[f"model.layers.{i}"] = 0
+            elif i < gpu0_layers + gpu1_layers:
+                device_map[f"model.layers.{i}"] = 1
+            else:
+                device_map[f"model.layers.{i}"] = "cpu"
+        
+        print(f"Device map: GPU 0: {gpu0_layers} layers, GPU 1: {gpu1_layers} layers, CPU: {cpu_layers} layers")
+        
+        # Load with offloading and quantization
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            offload_folder=offload_folder,
+            offload_state_dict=True,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            use_cache=False,
+            attn_implementation="eager" if not USE_MEMORY_EFFICIENT_ATTENTION else "flash_attention_2"
+        )
+    else:
+        # Standard loading with basic memory optimization
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map="auto" if torch.cuda.is_available() else None,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            use_cache=False
+        )
     print("Successfully loaded model with BitsAndBytes 4-bit quantization")
 
-# Configure LoRA for fine-tuning (same for both quantization methods)
-print("Setting up LoRA fine-tuning...")
+# Configure LoRA for fine-tuning with memory optimizations
+print("Setting up memory-optimized LoRA fine-tuning...")
 lora_config = LoraConfig(
     r=LORA_R,
     lora_alpha=LORA_ALPHA,
     lora_dropout=LORA_DROPOUT,
     bias="none",
     task_type="CAUSAL_LM",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    # Target only essential modules to save memory
+    target_modules=["q_proj", "v_proj", "o_proj", "gate_proj"],
+    modules_to_save=None,  # Don't save any modules fully to save memory
 )
 
-# Prepare the model for training with LoRA
+# Prepare the model for training with LoRA and additional memory optimizations
+print("Preparing model for k-bit training...")
 model = prepare_model_for_kbit_training(model)
+
+# Enable activation checkpointing to save memory if requested
+if USE_ACTIVATION_CHECKPOINTING:
+    print("Enabling activation checkpointing to save memory...")
+    try:
+        # For transformers models
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled via model method")
+        # For torch models
+        elif hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+            print("Input require grads enabled")
+            
+        # Enable checkpointing on specific modules (for newer transformers versions)
+        for module in model.modules():
+            if hasattr(module, "_use_gradient_checkpointing"):
+                module._use_gradient_checkpointing = True
+    except Exception as e:
+        print(f"Warning: Could not enable activation checkpointing: {e}")
+
+# Apply LoRA and free memory
+print("Applying LoRA adapter...")
 model = get_peft_model(model, lora_config)
+
+# Run explicit memory cleanup after model initialization
+cleanup_memory()
+
+# Report model parameter counts
+print(f"Model trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+print(f"Model parameters using memory: {sum(p.numel() * (2 if p.dtype == torch.float16 else 4) for p in model.parameters()) / (1024**2):.2f} MB")
 
 # Print information about the quantized model
 quant_method = "AQLM" if USING_AQLM else "BitsAndBytes"
@@ -895,10 +1095,33 @@ print("="*80)
 
 print("🔧 Creating trainer and configuring training parameters...")
 
-# Create trainer for GPU/CPU
-print("Setting up trainer...")
+# Create trainer with memory optimizations for GPU/CPU
+print("Setting up memory-optimized trainer...")
+
+# Add additional memory optimization callbacks
+from transformers.trainer_callback import TrainerCallback
+
+class MemoryOptimizationCallback(TrainerCallback):
+    """Custom callback to optimize memory usage during training."""
     
-# Standard trainer for GPU/CPU
+    def on_step_end(self, args, state, control, **kwargs):
+        """Run cleanup after each optimization step."""
+        # Free memory every few steps
+        if state.global_step % 10 == 0:
+            cleanup_memory()
+        return control
+    
+    def on_evaluate(self, args, state, control, **kwargs):
+        """Run before evaluation begins."""
+        cleanup_memory()
+        return control
+    
+    def on_save(self, args, state, control, **kwargs):
+        """Run before model is saved."""
+        cleanup_memory()
+        return control
+
+# Create custom memory-efficient trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -906,7 +1129,10 @@ trainer = Trainer(
     eval_dataset=tokenized_val,
     tokenizer=tokenizer,
     data_collator=data_collator,
-    callbacks=[early_stopping_callback]
+    callbacks=[
+        early_stopping_callback,
+        MemoryOptimizationCallback()
+    ]
 )
 
 # Verify model device
@@ -962,33 +1188,116 @@ def monitor_resources():
     print("")  # Add blank line for readability
 
 
-print("🚀 Starting training process...")
+print("🚀 Starting training process with enhanced memory management...")
 print("This will take some time. Training progress will be displayed below.")
 
-# Run training with enhanced memory monitoring for multi-GPU setup
+# Run training with aggressive memory optimization for multi-GPU setup
 try:
     # Monitor resources before training
     print("Resources before training:")
     monitor_resources()
     
-    # Additional memory cleanup before training
-    cleanup_memory()
+    # Super aggressive memory cleanup before training
+    print("Performing deep memory cleanup before training...")
+    # Force multiple garbage collection passes
+    for _ in range(3):
+        cleanup_memory()
+        time.sleep(0.5)  # Brief pause to allow OS to reclaim memory
     
-    # Set hardware-specific optimizations
+    # Set environment variables for even more aggressive memory management
+    os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"  # Disable CUDA caching
+    
+    # Configure PyTorch for memory-efficient multi-GPU training
     if torch.cuda.device_count() > 1:
-        print("Configuring PyTorch for multi-GPU training...")
+        print("Configuring PyTorch for memory-efficient multi-GPU training...")
         # Enable TF32 precision for faster training (on Ampere GPUs)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation strategy
-        torch.cuda.set_per_process_memory_fraction(0.95)  # Reserve some memory for system
+        
+        # More conservative memory allocation strategy
+        torch.cuda.set_per_process_memory_fraction(0.85)  # Reserve more memory (15%) for system
+        
+        # Try to enable memory-efficient attention if available
+        try:
+            from transformers.utils import is_flash_attn_available
+            if is_flash_attn_available():
+                print("Flash Attention is available and will be used")
+            else:
+                print("Flash Attention not available, using standard attention")
+        except ImportError:
+            pass
     
-    # Start training with a timeout
+    # Set up a memory monitor thread for continuous monitoring during training
+    def memory_monitoring_thread():
+        print("Starting memory monitoring thread...")
+        while True:
+            try:
+                # Only log if we're close to OOM
+                for i in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                    if allocated / total > 0.85:  # If using more than 85% of memory
+                        print(f"⚠️ WARNING: GPU {i} memory usage high: {allocated:.2f}GB / {total:.2f}GB ({allocated/total*100:.1f}%)")
+                        cleanup_memory()  # Try to free up memory
+            except Exception as e:
+                print(f"Error in memory monitoring: {e}")
+            time.sleep(10)  # Check every 10 seconds
+
+    # Start memory monitoring in a separate thread if not in debug mode
+    if not DEBUG_MODE:
+        import threading
+        monitor_thread = threading.Thread(target=memory_monitoring_thread, daemon=True)
+        monitor_thread.start()
+    
+    # Start training 
     start_time = time.time()
     
-    # Run training
-    print("\n🚀 Starting training...")
-    train_result = trainer.train()
+    # Configure training to catch OOM errors and retry with more aggressive settings
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"\n🚀 Starting training (attempt {attempt+1}/{max_retries})...")
+            
+            # Additional cleanup right before training
+            cleanup_memory()
+            
+            # Run training
+            train_result = trainer.train()
+            
+            # If we get here, training succeeded
+            print("✅ Training completed successfully!")
+            break
+            
+        except RuntimeError as e:
+            # Check if this is an OOM error
+            if "CUDA out of memory" in str(e):
+                print(f"❌ CUDA out of memory error (attempt {attempt+1}/{max_retries})")
+                
+                # More aggressive cleanup
+                cleanup_memory()
+                
+                if attempt < max_retries - 1:
+                    # Try more aggressive memory saving for next attempt
+                    print("Applying more aggressive memory optimizations for next attempt...")
+                    
+                    # Reduce batch size if possible
+                    if trainer.args.per_device_train_batch_size > 1:
+                        trainer.args.per_device_train_batch_size //= 2
+                        trainer.args.per_device_eval_batch_size //= 2
+                        print(f"Reduced batch size to {trainer.args.per_device_train_batch_size}")
+                    
+                    # Increase gradient accumulation steps
+                    trainer.args.gradient_accumulation_steps *= 2
+                    print(f"Increased gradient accumulation to {trainer.args.gradient_accumulation_steps}")
+                    
+                    # Wait a moment for memory to be fully reclaimed
+                    time.sleep(10)
+                else:
+                    print("Maximum retry attempts reached. Training failed.")
+                    raise
+            else:
+                # This is not an OOM error, re-raise
+                raise
     
     # Monitor resources after training
     print("Resources after training:")
