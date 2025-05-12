@@ -839,7 +839,37 @@ try:
             }
             
             # Distribute layers across devices with CPU/disk offloading
-            n_layers = config.num_hidden_layers
+            # Get number of layers with compatibility for different model types
+            n_layers = None
+            # Try different attribute names used by various model architectures
+            for attr_name in ["num_hidden_layers", "n_layer", "num_layers", "n_blocks"]:
+                if hasattr(config, attr_name):
+                    n_layers = getattr(config, attr_name)
+                    print(f"Found layers count using config.{attr_name}: {n_layers}")
+                    break
+            
+            # As fallback for Phi-3 models, try to detect layers by architecture patterns
+            if n_layers is None:
+                # For Phi-3 models specifically
+                if hasattr(config, "model_type") and "phi" in config.model_type.lower():
+                    # Phi-3 typically has 32 layers in the mini version
+                    if "mini" in MODEL_NAME.lower():
+                        n_layers = 32
+                    # Phi-3-medium typically has 60 layers
+                    elif "medium" in MODEL_NAME.lower():
+                        n_layers = 60
+                    # Phi-3-small typically has 26 layers
+                    elif "small" in MODEL_NAME.lower():
+                        n_layers = 26
+                    else:
+                        # Default to 32 for unknown Phi-3 variants
+                        n_layers = 32
+                    print(f"Using estimated layers for Phi-3 model: {n_layers}")
+                else:
+                    # Last resort default
+                    n_layers = 24
+                    print(f"Warning: Could not determine number of layers, using default: {n_layers}")
+            
             gpu0_layers = n_layers // 4      # 25% on GPU 0
             gpu1_layers = n_layers // 4      # 25% on GPU 1
             cpu_layers = n_layers - gpu0_layers - gpu1_layers  # Rest on CPU with potential disk offload
@@ -988,34 +1018,122 @@ except Exception as e:
         }
         
         # Distribute layers across devices with CPU/disk offloading
-        n_layers = config.num_hidden_layers
+        # Get number of layers with compatibility for different model types
+        n_layers = None
+        # Try different attribute names used by various model architectures
+        for attr_name in ["num_hidden_layers", "n_layer", "num_layers", "n_blocks"]:
+            if hasattr(config, attr_name):
+                n_layers = getattr(config, attr_name)
+                print(f"Found layers count using config.{attr_name}: {n_layers}")
+                break
+        
+        # As fallback for Phi-3 models, try to detect layers by architecture patterns
+        if n_layers is None:
+            # For Phi-3 models specifically
+            if hasattr(config, "model_type") and "phi" in config.model_type.lower():
+                # Phi-3 typically has 32 layers in the mini version
+                if "mini" in MODEL_NAME.lower():
+                    n_layers = 32
+                # Phi-3-medium typically has 60 layers
+                elif "medium" in MODEL_NAME.lower():
+                    n_layers = 60
+                # Phi-3-small typically has 26 layers
+                elif "small" in MODEL_NAME.lower():
+                    n_layers = 26
+                else:
+                    # Default to 32 for unknown Phi-3 variants
+                    n_layers = 32
+                print(f"Using estimated layers for Phi-3 model: {n_layers}")
+            else:
+                # Last resort default
+                n_layers = 24
+                print(f"Warning: Could not determine number of layers, using default: {n_layers}")
+        
         gpu0_layers = n_layers // 3   # 33% on GPU 0
         gpu1_layers = n_layers // 3   # 33% on GPU 1
         cpu_layers = n_layers - gpu0_layers - gpu1_layers  # 34% on CPU with potential disk offload
         
-        # Assign layers to devices
+        # Determine the correct layer naming pattern for different model architectures
+        # For Phi-3 models, the pattern might be different than standard transformers
+        layer_prefix = "model.layers"  # Default pattern
+        
+        # Try to determine correct layer prefix from model config
+        if hasattr(config, "model_type"):
+            model_type = config.model_type.lower()
+            if "phi" in model_type:
+                # Phi models may use different naming conventions
+                # We'll try a few common patterns for Phi-3
+                layer_prefix_options = [
+                    "model.layers",         # Standard pattern
+                    "transformer.h",        # Some Phi models use this
+                    "model.decoder.layers", # Another common pattern
+                    "model.transformer.h",  # Yet another pattern
+                ]
+                
+                # Log the possible patterns we're going to try
+                print(f"Phi model detected, will try these layer prefix patterns: {layer_prefix_options}")
+                
+                # Use the first one by default, the device_map will be adjusted at runtime if needed
+                layer_prefix = layer_prefix_options[0]
+        
+        print(f"Using layer prefix pattern: {layer_prefix}")
+        
+        # Assign layers to devices with multiple pattern fallbacks
         for i in range(n_layers):
+            layer_device = None
             if i < gpu0_layers:
-                device_map[f"model.layers.{i}"] = 0
+                layer_device = 0
             elif i < gpu0_layers + gpu1_layers:
-                device_map[f"model.layers.{i}"] = 1
+                layer_device = 1
             else:
-                device_map[f"model.layers.{i}"] = "cpu"
+                layer_device = "cpu"
+            
+            # Add all possible layer naming patterns to device map to ensure we catch the right one
+            if hasattr(config, "model_type") and "phi" in config.model_type.lower():
+                # Add all possible patterns for Phi models
+                device_map[f"model.layers.{i}"] = layer_device
+                device_map[f"transformer.h.{i}"] = layer_device
+                device_map[f"model.decoder.layers.{i}"] = layer_device
+                device_map[f"model.transformer.h.{i}"] = layer_device
+            else:
+                # Standard pattern for other models
+                device_map[f"{layer_prefix}.{i}"] = layer_device
         
         print(f"Device map: GPU 0: {gpu0_layers} layers, GPU 1: {gpu1_layers} layers, CPU: {cpu_layers} layers")
         
-        # Load with offloading and quantization
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            offload_folder=offload_folder,
-            offload_state_dict=True,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            use_cache=False,
-            attn_implementation="eager" if not USE_MEMORY_EFFICIENT_ATTENTION else "flash_attention_2"
-        )
+        # Load with offloading and quantization - with error handling and fallbacks
+        try:
+            print("Attempting to load model with custom device map...")
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                offload_folder=offload_folder,
+                offload_state_dict=True,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                use_cache=False,
+                attn_implementation="eager" if not USE_MEMORY_EFFICIENT_ATTENTION else "flash_attention_2"
+            )
+        except Exception as e:
+            print(f"Error loading with custom device map: {e}")
+            print("Falling back to automatic device map...")
+            
+            # Fallback to simpler device map with auto distribution
+            cleanup_memory()  # Clean up memory before retrying
+            
+            # Try again with simpler configuration
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                quantization_config=bnb_config,
+                device_map="auto",  # Let HF decide automatically
+                offload_folder=offload_folder,
+                offload_state_dict=True,
+                max_memory={0: "10GB", 1: "10GB", "cpu": "30GB"},  # Limit memory usage
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                use_cache=False
+            )
     else:
         # Standard loading with basic memory optimization
         model = AutoModelForCausalLM.from_pretrained(
