@@ -73,15 +73,6 @@ print("Starting Phi-3 training pipeline...")
 print("📦 Installing required libraries...")
 !pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
 
-# Install PyTorch/XLA for TPU support
-try:
-    print("Installing PyTorch/XLA for TPU support...")
-    !pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
-    TPU_INSTALLATIONS_ATTEMPTED = True
-except Exception as e:
-    print(f"Note: PyTorch/XLA installation error: {e}. TPU support may not be available.")
-    TPU_INSTALLATIONS_ATTEMPTED = False
-
 # Set PyTorch memory management environment variables to avoid fragmentation
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -114,19 +105,6 @@ from transformers import (
 )
 from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-# Try to import PyTorch/XLA for TPU support
-TPU_AVAILABLE = False
-try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    TPU_AVAILABLE = True
-    print("✓ PyTorch/XLA successfully imported - TPU support is available")
-except ImportError:
-    print("PyTorch/XLA not available - TPU support will not be enabled")
-    TPU_AVAILABLE = False
 # Import AQLM for 2-bit quantization
 try:
     try:
@@ -179,26 +157,8 @@ def monitor_resources():
 
 
 # %%
-# Check for available accelerators (TPU, GPU, or CPU) and configure accordingly
-if TPU_AVAILABLE:
-    # Set up for TPU training
-    device = xm.xla_device()
-    print(f"🚀 Using TPU: {xm.get_device_type()}")
-    print(f"TPU cores available: {xm.xrt_world_size()}")
-    
-    # Print TPU specific information
-    tpu_info = {}
-    try:
-        tpu_info['device'] = str(device)
-        tpu_info['xla_device_type'] = xm.get_device_type()
-        tpu_info['xla_world_size'] = xm.xrt_world_size()
-        print(f"TPU Details: {json.dumps(tpu_info, indent=2)}")
-    except Exception as e:
-        print(f"Error getting TPU details: {e}")
-    
-    # TPU memory management
-    print("Optimizing for TPU training...")
-elif torch.cuda.is_available():
+# Configure device (GPU or CPU)
+if torch.cuda.is_available():
     # Set up for distributed training on multiple GPUs
     device = torch.device('cuda')
     print(f"Using GPU: {torch.cuda.get_device_name(0)}")
