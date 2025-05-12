@@ -1,8 +1,10 @@
 name: Convert Python Scripts to Jupyter Notebooks
 
 on:
+  push:
     branches:
-   paths:
+      - main  # Specify the branch explicitly
+    paths:
       - 'Training/Train-Phi3-2bit.py'
       - 'Training/Train-Phi3-4bit.py'
   workflow_dispatch:
@@ -15,6 +17,8 @@ jobs:
       # Checkout the repository
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # Set up Python
       - name: Set up Python
@@ -30,26 +34,29 @@ jobs:
 
       # Ensure Notebooks directory exists
       - name: Create Notebooks directory
-        run: |
-          mkdir -p Notebooks
+        run: mkdir -p Notebooks
 
       # Convert Python scripts to Jupyter notebooks
       - name: Convert scripts to notebooks
         run: |
-          if [ -f Training/Train-Phi3-2bit.py ]; then
-            jupytext --to notebook Training/Train-Phi3-2bit.py -o Notebooks/Train-Phi3-2bit.ipynb
-          fi
-          if [ -f Training/Train-Phi3-4bit.py ]; then
-            jupytext --to notebook Training/Train-Phi3-4bit.py -o Notebooks/Train-Phi3-4bit.ipynb
-          fi
+          for script in Training/Train-Phi3-2bit.py Training/Train-Phi3-4bit.py; do
+            if [ -f "$script" ]; then
+              notebook="Notebooks/$(basename "${script%.py}").ipynb"
+              jupytext --to notebook "$script" -o "$notebook"
+            fi
+          done
 
       # Commit and push the notebooks if changes exist
       - name: Commit notebooks
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add Notebooks/Train-Phi3-2bit.ipynb Notebooks/Train-Phi3-4bit.ipynb
-          git diff --staged --quiet || git commit -m "Convert Train-Phi3-2bit.py and Train-Phi3-4bit.py to Jupyter notebooks in Notebooks folder"
-          git push
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Notebooks/*.ipynb
+          if ! git diff --staged --quiet; then
+            git commit -m "Convert Python scripts to Jupyter notebooks"
+            git push
+          else
+            echo "No changes to commit"
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
