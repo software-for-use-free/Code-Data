@@ -34,6 +34,7 @@ except Exception as e:
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Explicitly set to use 2 GPUs
+os.environ["USE_TORCH_XLA"] = "0"  # Disable XLA (TPU) support to avoid import errors
 
 # %%
 # Import required libraries
