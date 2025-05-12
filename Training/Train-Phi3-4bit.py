@@ -36,6 +36,7 @@ import psutil
 import os
 import gc
 import json
+import transformers
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM, 
@@ -682,6 +683,9 @@ try:
     
     # Configure LoRA for efficient fine-tuning
     print("Setting up LoRA fine-tuning...")
+    # Get label names from category names
+    label_names = [category_names[i] for i in range(len(category_names))]
+    
     lora_config = LoraConfig(
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
@@ -689,6 +693,7 @@ try:
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        label_names=label_names
     )
     
     # Prepare the model for training - crucial for memory efficiency
