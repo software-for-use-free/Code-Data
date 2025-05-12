@@ -67,7 +67,7 @@ try:
     if hasattr(bnb, "COMPILED_WITH_CUDA"):
         print(f"✓ Compiled with CUDA: {bnb.COMPILED_WITH_CUDA}")
     # Check for multi-backend support
-    if "get_available_modules" in dir(bnb) or "has_cuda_extension" in dir(bnb.cuda):
+    if "get_available_modules" in dir(bnb) or (hasattr(bnb, "cuda") and "has_cuda_extension" in dir(bnb.cuda)):
         print("✓ Multi-backend support detected")
     print("BitsAndBytes installation looks good!")
 except ImportError as e:
