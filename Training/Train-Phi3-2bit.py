@@ -975,13 +975,7 @@ try:
     cleanup_memory()
     
     # Set hardware-specific optimizations
-    if TPU_AVAILABLE:
-        print("Configuring PyTorch for TPU training...")
-        # TPU-specific optimizations
-        # TPUs work best with bfloat16 precision
-        print("TPU training starting with bfloat16 precision...")
-        
-    elif torch.cuda.device_count() > 1:
+    if torch.cuda.device_count() > 1:
         print("Configuring PyTorch for multi-GPU training...")
         # Enable TF32 precision for faster training (on Ampere GPUs)
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -992,21 +986,9 @@ try:
     # Start training with a timeout
     start_time = time.time()
     
-    # Run training with device-specific approach
-    if TPU_AVAILABLE:
-        print("\n🚀 Starting TPU training...")
-        train_result = trainer.train()
-        
-        # Additional TPU verification during training
-        print("\nTPU Training Statistics:")
-        if hasattr(xm, 'get_memory_info'):
-            mem_info = xm.get_memory_info(device)
-            print(f"TPU Memory - Free: {mem_info['kb_free']/1024:.2f} MB, Total: {mem_info['kb_total']/1024:.2f} MB")
-        print(f"TPU Device: {xm.get_device_type()}")
-    else:
-        # Standard training for GPU/CPU
-        print("\n🚀 Starting training on {device}...")
-        train_result = trainer.train()
+    # Run training
+    print("\n🚀 Starting training...")
+    train_result = trainer.train()
     
     # Monitor resources after training
     print("Resources after training:")
@@ -1019,20 +1001,13 @@ try:
     # Save the model with appropriate method based on quantization used
     print("\n💾 Saving trained model...")
     
-    # Ensure proper model saving based on the hardware
-    if TPU_AVAILABLE:
-        # For TPU, ensure we're on CPU before saving to avoid XLA tensor issues
-        print("Moving model to CPU before saving (TPU compatibility)...")
-        # Synchronize TPU operations before saving
-        if hasattr(xm, 'rendezvous'):
-            xm.rendezvous("save_checkpoint")
-        
+    # Save the model
     trainer.save_model("./phi3_swift_model")
     
     # Determine the quantization method for display
     quant_method = "AQLM" if USING_AQLM else "BitsAndBytes"
     print(f"✅ Model saved to ./phi3_swift_model ({QUANT_BITS}-bit {quant_method} quantized)")
-    print(f"   Trained on: {'TPU' if TPU_AVAILABLE else 'GPU' if torch.cuda.is_available() else 'CPU'}")
+    print(f"   Trained on: {'GPU' if torch.cuda.is_available() else 'CPU'}")
     
     # Save model configuration details
     with open("./phi3_swift_model/quantization_config.json", "w") as f:
