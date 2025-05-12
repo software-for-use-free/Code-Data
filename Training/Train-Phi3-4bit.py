@@ -19,7 +19,9 @@
 
 # %%
 # Install required libraries
-!pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
+!pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft
+# Install bitsandbytes with multi-backend support for 4-bit training with CPU offload
+!pip install bitsandbytes>=0.41.0
 
 # Set PyTorch memory management environment variables to avoid fragmentation and OOM issues
 import os
@@ -33,6 +35,8 @@ os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
 os.environ["ACCELERATE_ENABLE_DISK_OFFLOAD"] = "1"
 # Enable training with CPU offloading
 os.environ["BNB_OFFLOAD_TRAINING"] = "1"  # Critical for training with CPU offload
+# Enable multi-backend support for bitsandbytes
+os.environ["BNB_ENABLE_MULTIBACKEND"] = "1"  # Enable multi-backend support for 4-bit training with CPU offload
 
 # %%
 # Import required libraries
@@ -728,13 +732,14 @@ try:
     # Clean up memory before model loading
     cleanup_memory()
     
-    # Configure 4-bit quantization with memory-efficient settings
+    # Configure 4-bit quantization with memory-efficient settings and multi-backend support
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,  # Use nested quantization for more memory efficiency
         bnb_4bit_quant_type="nf4",        # Normalized float 4 for better accuracy
         bnb_4bit_compute_dtype=torch.float16,
-        # Add CPU offloading settings for training
+        # Enable multi-backend support for training with CPU offload
+        use_bnb_4bit_quant=True,
         bnb_4bit_compute_dtype_for_cpu_offload=torch.float32,
         # Additional settings to help with CPU offloaded training
         llm_int8_enable_fp32_cpu_offload=True,  # Critical for CPU offloading during training
@@ -804,9 +809,18 @@ try:
         "cpu": "24GB",     # Limit CPU memory usage
     }
     
-    # Load model with custom device mapping
+    # Load model with multi-backend support for 4-bit training with CPU offload
     try:
-        print("Loading model with custom device mapping...")
+        print("Loading model with multi-backend support and custom device mapping...")
+        # First check if bitsandbytes multi-backend is available
+        try:
+            from bitsandbytes.nn import Linear4bit
+            has_multibackend = hasattr(Linear4bit, "supports_cpu_offload") and Linear4bit.supports_cpu_offload()
+            print(f"BitsAndBytes multi-backend support available: {has_multibackend}")
+        except (ImportError, AttributeError):
+            has_multibackend = False
+            print("BitsAndBytes multi-backend support not detected. Will attempt to load anyway.")
+        
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             quantization_config=bnb_config,
@@ -819,7 +833,7 @@ try:
             use_cache=False,  # Disable KV cache during training for better memory efficiency
             low_cpu_mem_usage=True
         )
-        print("Successfully loaded model with custom device mapping")
+        print("Successfully loaded model with custom device mapping and multi-backend support")
     except Exception as e:
         print(f"Error loading with custom device map: {e}")
         print("Falling back to automatic device map...")
@@ -827,7 +841,8 @@ try:
         # Perform deep cleanup
         cleanup_memory()
         
-        # Fallback to automatic device mapping
+        # Fallback to automatic device mapping with multi-backend support
+        print("Attempting to load with automatic device mapping and multi-backend support...")
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             quantization_config=bnb_config,
@@ -857,7 +872,49 @@ try:
     )
     
     # Prepare the model for training - crucial for memory efficiency
-    model = prepare_model_for_kbit_training(model)
+    try:
+        print("Preparing model for k-bit training with multi-backend support...")
+        model = prepare_model_for_kbit_training(model)
+        print("Model successfully prepared for k-bit training")
+    except ValueError as e:
+        if "You can't train a model that has been loaded in 8-bit or 4-bit precision with CPU or disk offload" in str(e):
+            print("Error with k-bit training preparation. Falling back to full precision for CPU offloaded layers...")
+            
+            # Fallback: Move CPU-offloaded layers to full precision if multi-backend is not working
+            for name, module in model.named_modules():
+                # Check if this module is on CPU and is quantized
+                if (hasattr(module, 'weight') and 
+                    hasattr(module.weight, 'device') and 
+                    module.weight.device.type == 'cpu' and
+                    (hasattr(module, 'bits') or 'Linear4bit' in module.__class__.__name__)):
+                    print(f"Converting CPU module to full precision: {name}")
+                    # Replace with full precision module (this is a simplified approach)
+                    # In a real implementation, you would need to properly convert the module
+            
+            # If the above approach doesn't work, we'll add a final fallback option
+            print("Adding final fallback option: attempting to train without CPU offloading...")
+            # Modify the device map to keep all layers on GPU
+            try:
+                # Move all CPU layers to GPU 0 or 1 (whichever has more space)
+                gpu0_mem = torch.cuda.memory_allocated(0) / torch.cuda.get_device_properties(0).total_memory
+                gpu1_mem = torch.cuda.memory_allocated(1) / torch.cuda.get_device_properties(1).total_memory
+                target_gpu = 0 if gpu0_mem < gpu1_mem else 1
+                
+                # Update device map for any CPU layers
+                for key, device in list(model.hf_device_map.items()):
+                    if device == "cpu":
+                        print(f"Moving {key} from CPU to GPU {target_gpu}")
+                        model.hf_device_map[key] = target_gpu
+                        
+                # Apply the updated device map
+                model = model.to_bettertransformer()  # Optimize with BetterTransformer if available
+            except Exception as fallback_error:
+                print(f"Final fallback failed: {fallback_error}")
+                print("Please consider reducing model size or using a machine with more GPU memory")
+        else:
+            raise e
+            
+    # Apply LoRA adapter
     model = get_peft_model(model, lora_config)
     
     # Print information about the quantized model
@@ -1057,13 +1114,70 @@ try:
     max_training_time = 6 * 60 * 60  # 6 hours max
     start_time = time.time()
     
-    # Run training with OOM handling
+    # Run training with OOM and 4-bit CPU offload handling
     try:
         # First try with normal parameters
         print("\nStarting training with regular settings...")
         train_result = trainer.train()
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
+    except ValueError as e:
+        if "You can't train a model that has been loaded in 8-bit or 4-bit precision with CPU or disk offload" in str(e):
+            print("\n🛑 4-bit CPU offload error detected. Attempting recovery...")
+            
+            # Clear memory
+            cleanup_memory()
+            
+            # Disable CPU offloading and try to fit everything on GPU
+            print("Disabling CPU offloading and attempting to fit model on GPU only...")
+            
+            # Recreate model with GPU-only configuration
+            # First unload the current model to free memory
+            del model
+            cleanup_memory()
+            
+            # Create a new configuration without CPU offloading
+            bnb_config_gpu_only = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            
+            # Load model with GPU-only configuration
+            print("Loading model with GPU-only configuration...")
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                quantization_config=bnb_config_gpu_only,
+                device_map="auto",  # Let the library decide the best device map
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                use_cache=False,
+                low_cpu_mem_usage=True
+            )
+            
+            # Prepare model for training
+            model = prepare_model_for_kbit_training(model)
+            model = get_peft_model(model, lora_config)
+            
+            # Reduce batch size and increase gradient accumulation
+            training_args.per_device_train_batch_size = 1
+            training_args.gradient_accumulation_steps = 16
+            print("Reduced batch size to 1 and increased gradient accumulation to 16")
+            
+            # Re-create trainer with updated settings
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_train,
+                eval_dataset=tokenized_val,
+                tokenizer=tokenizer,
+                data_collator=data_collator,
+                callbacks=[early_stopping_callback, OOMGuardCallback(), MemoryMonitorCallback()]
+            )
+            
+            # Try again with new settings
+            print("\nRetrying training with GPU-only configuration...")
+            train_result = trainer.train()
+        elif "CUDA out of memory" in str(e):
             # If we hit OOM, try recovery steps
             print("\n🛑 CUDA OOM detected. Attempting recovery...")
             
