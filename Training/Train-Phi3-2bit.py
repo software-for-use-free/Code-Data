@@ -62,14 +62,54 @@ print("👉 Installing BitsAndBytes with multi-backend support for CPU offloadin
 print("👉 Verifying BitsAndBytes installation...")
 try:
     import bitsandbytes as bnb
+    import torch
     print(f"✓ BitsAndBytes version: {bnb.__version__}")
-    # Check if compiled with CUDA support
+    
+    # Check if compiled with CUDA support (different ways depending on version)
+    cuda_available = False
+    
+    # Method 1: Check COMPILED_WITH_CUDA attribute (older versions)
     if hasattr(bnb, "COMPILED_WITH_CUDA"):
-        print(f"✓ Compiled with CUDA: {bnb.COMPILED_WITH_CUDA}")
-    # Check for multi-backend support
-    if "get_available_modules" in dir(bnb) or (hasattr(bnb, "cuda") and "has_cuda_extension" in dir(bnb.cuda)):
-        print("✓ Multi-backend support detected")
-    print("BitsAndBytes installation looks good!")
+        cuda_available = bnb.COMPILED_WITH_CUDA
+        print(f"✓ Compiled with CUDA: {cuda_available}")
+    
+    # Method 2: Check cuda_specs module (newer versions)
+    elif hasattr(bnb, "cuda_specs") and hasattr(bnb.cuda_specs, "CUDA_AVAILABLE"):
+        cuda_available = bnb.cuda_specs.CUDA_AVAILABLE
+        print(f"✓ CUDA available (from cuda_specs): {cuda_available}")
+    
+    # Method 3: Check if CUDA is available through torch
+    elif hasattr(torch, "cuda") and torch.cuda.is_available():
+        cuda_available = True
+        print(f"✓ CUDA available through PyTorch: {torch.cuda.is_available()}")
+    else:
+        print("⚠️ CUDA support not detected in bitsandbytes")
+    
+    # Check for multi-backend support (different ways depending on version)
+    has_multi_backend = False
+    
+    # Method 1: Check for get_available_modules function
+    if "get_available_modules" in dir(bnb):
+        has_multi_backend = True
+        print("✓ Multi-backend support detected (get_available_modules)")
+    
+    # Method 2: Check for cuda module with has_cuda_extension
+    elif hasattr(bnb, "cuda"):
+        # Only check for has_cuda_extension if bnb.cuda exists
+        if hasattr(bnb.cuda, "has_cuda_extension"):
+            has_multi_backend = True
+            print("✓ Multi-backend support detected (cuda.has_cuda_extension)")
+    
+    # Method 3: Check for diagnostics.cuda module
+    elif hasattr(bnb, "diagnostics") and hasattr(bnb.diagnostics, "cuda"):
+        print("✓ CUDA diagnostics module detected")
+        has_multi_backend = True
+    
+    if not has_multi_backend:
+        print("⚠️ Multi-backend support not detected, but continuing anyway")
+    
+    print("BitsAndBytes installation looks good enough to proceed!")
+    
 except ImportError as e:
     print(f"⚠️ BitsAndBytes import failed: {e}")
     print("Installing fallback version...")
