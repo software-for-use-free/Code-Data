@@ -1,7 +1,8 @@
 name: Convert Python Scripts to Jupyter Notebooks
 
 on:
-  paths:
+    branches:
+   paths:
       - 'Training/Train-Phi3-2bit.py'
       - 'Training/Train-Phi3-4bit.py'
   workflow_dispatch:
