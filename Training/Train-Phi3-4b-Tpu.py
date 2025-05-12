@@ -24,17 +24,10 @@
 !pip install -q 'torch_xla[tpu]==2.1.0' -f https://storage.googleapis.com/libtpu-releases/index.html
 !pip install -q transformers==4.38.1 datasets==2.16.1 evaluate==0.4.1 scikit-learn tqdm dropbox requests accelerate==0.28.0 peft==0.7.1
 
-# Set environment variables for TPU
+# Set common TPU configuration
 import os
-# Check for TPU environment and set appropriate variables
-if "COLAB_TPU_ADDR" in os.environ:
-    print(f"Setting up Colab TPU: {os.environ['COLAB_TPU_ADDR']}")
-    os.environ["XLA_USE_BF16"] = "1"  # Enable bfloat16 for better performance
-elif "TPU_NAME" in os.environ:  
-    print(f"Using Cloud TPU: {os.environ['TPU_NAME']}")
-else:
-    print("No TPU environment detected, setting to local")
-    os.environ["TPU_NAME"] = "local"
+# Enable BF16 for better TPU performance by default
+os.environ["XLA_USE_BF16"] = "1"
 
 # %%
 # Import required libraries
@@ -66,10 +59,10 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# TPU detection and imports with error handling
+# TPU detection and imports with universal approach
 TPU_AVAILABLE = False
 try:
-    # Try to import TPU-specific libraries
+    # Import TPU-specific libraries - will work on both Kaggle and Google Cloud
     import torch_xla
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
@@ -77,12 +70,21 @@ try:
     from torch_xla.distributed.parallel_loader import ParallelLoader
     import torch_xla.debug.metrics as met
     
-    # Verify TPU is actually available
-    if torch_xla.xla_device_hw(devkind='TPU') is not None:
+    # Try to create a TPU device to verify availability
+    try:
+        tpu_device = xm.xla_device()
+        # Run a simple operation to verify device is working
+        test_tensor = torch.ones(1)
+        test_tensor = test_tensor.to(tpu_device)
+        _ = test_tensor + 1
+        xm.mark_step()  # Sync TPU operation
+        
         TPU_AVAILABLE = True
-        logger.info("TPU detected and PyTorch XLA successfully imported")
-    else:
-        logger.warning("PyTorch XLA imported but no TPU devices detected")
+        logger.info("✅ TPU detected and verified functional")
+    except Exception as device_error:
+        logger.warning(f"TPU device creation failed: {device_error}")
+        logger.warning("PyTorch XLA is available but TPU device is not accessible")
+        TPU_AVAILABLE = False
         
 except ImportError as e:
     logger.warning(f"Could not import PyTorch XLA. TPU will not be available. Error: {e}")
@@ -115,6 +117,15 @@ except ImportError as e:
     xm = XMPlaceholder()
     met = MetPlaceholder()
     TPU_AVAILABLE = False
+
+# Log detected hardware
+if TPU_AVAILABLE:
+    logger.info(f"Will use TPU device with {xm.xrt_world_size()} cores")
+elif torch.cuda.is_available():
+    logger.info(f"Will use GPU: {torch.cuda.get_device_name(0)}")
+    logger.info(f"CUDA devices available: {torch.cuda.device_count()}")
+else:
+    logger.info("Will use CPU (no accelerator detected)")
 
 # Define memory cleanup function for TPU
 def cleanup_memory():
@@ -190,46 +201,36 @@ def monitor_resources():
 
 
 # %%
-# Configure device (TPU, GPU, or CPU)
+# Configure device (TPU, GPU, or CPU) - simplified for cross-platform compatibility
 def setup_device():
-    """Set up the appropriate device based on what's available."""
+    """Set up the appropriate device based on what's available (platform-agnostic)."""
+    
+    # Use TPU if available - works on both Kaggle and Google Cloud
     if TPU_AVAILABLE:
-        try:
-            device = xm.xla_device()
-            logger.info(f"Using TPU device: {device}")
-            logger.info(f"Number of TPU devices: {xm.xrt_world_size()}")
-            logger.info(f"TPU type: {xm.get_device_type()}")
-            
-            # Print TPU configuration details
-            logger.info("TPU Configuration:")
-            logger.info(f"  TPU cores: {xm.xrt_world_size()}")
+        # TPU already verified during detection phase
+        device = xm.xla_device()
+        logger.info(f"Setting up TPU device: {device}")
+        logger.info(f"TPU cores available: {xm.xrt_world_size()}")
+        
+        # Print additional TPU configuration for debugging
+        if xm.xrt_world_size() > 1:
+            logger.info(f"Multi-core TPU configuration:")
             logger.info(f"  Local ordinal: {xm.get_local_ordinal()}")
             logger.info(f"  Global ordinal: {xm.get_ordinal()}")
             
-            # Verify TPU is actually working with a small tensor operation
-            test_tensor = torch.randn(2, 2)
-            test_tensor = test_tensor.to(device)
-            _ = test_tensor + test_tensor  # Simple operation to verify device works
-            xm.mark_step()  # Sync TPU
-            logger.info("✅ TPU verification passed")
-            
-            return device, "tpu"
-            
-        except Exception as e:
-            logger.warning(f"TPU initialization failed: {e}")
-            logger.warning("Falling back to GPU or CPU")
-            TPU_AVAILABLE = False
+        return device, "tpu"
     
     # Fall back to GPU if available
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"Number of GPUs available: {torch.cuda.device_count()}")
+        logger.info(f"Setting up GPU: {torch.cuda.get_device_name(0)}")
+        if torch.cuda.device_count() > 1:
+            logger.info(f"Multiple GPUs available: {torch.cuda.device_count()}")
         return device, "gpu"
     
     # Fall back to CPU as last resort
     device = torch.device("cpu")
-    logger.info("Using CPU device")
+    logger.info("Setting up CPU device (no accelerators available)")
     return device, "cpu"
 
 # Set random seeds for reproducibility
@@ -799,13 +800,18 @@ try:
     
     # Add device-specific settings
     if device_type == "tpu":
-        # TPU-specific settings
+        # TPU-specific settings - automatically detect cores
+        tpu_cores = xm.xrt_world_size()
+        # Optimize dataloader workers based on TPU size
+        num_workers = max(1, min(4, tpu_cores // 2))
+        
         training_args_dict.update({
-            "tpu_num_cores": 8,  # Specify the number of TPU cores
-            "dataloader_num_workers": 2,
+            "tpu_num_cores": tpu_cores,  # Use detected number of TPU cores
+            "dataloader_num_workers": num_workers,
             "dataloader_pin_memory": False,
             "fp16": False,  # TPUs prefer bfloat16 over fp16
-            "bf16": True,  # Enable bfloat16 for TPUs
+            "bf16": True,   # Enable bfloat16 for TPUs
+            "xla": True,    # Enable XLA optimization
         })
     elif device_type == "gpu":
         # GPU-specific settings
@@ -883,7 +889,11 @@ try:
         model_loading_kwargs.update({
             "torch_dtype": MODEL_DTYPE,  # bfloat16 for TPU
             "low_cpu_mem_usage": True,
+            # Never use 8-bit quantization with TPUs
             "load_in_8bit": False,
+            # For all TPU providers (Kaggle/GCP/etc.), these settings help with stability
+            "use_flash_attention_2": False,  # Flash attention not compatible with TPUs
+            "attn_implementation": "eager",  # Use standard attention implementation
         })
     elif device_type == "gpu":
         model_loading_kwargs.update({
@@ -1390,12 +1400,17 @@ try:
     logger.info(f"\nTraining completed in {elapsed_time/60:.2f} minutes")
     logger.info(f"Training loss: {train_result.metrics['train_loss']:.4f}")
     
-    # Save the model - with device-specific handling
+    # Save the model - with platform-agnostic paths
     logger.info("\nSaving model...")
     
-    # Define output paths
-    model_output_path = f"./phi3_{device_type}_swift_model"
-    adapter_output_path = f"./phi3_{device_type}_swift_model_adapter"
+    # Use relative paths that work on all platforms
+    base_output_dir = os.path.join(".", "models")
+    os.makedirs(base_output_dir, exist_ok=True)
+    
+    # Define output paths using relative paths with timestamp
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    model_output_path = os.path.join(base_output_dir, f"phi3_{device_type}_swift_{timestamp}")
+    adapter_output_path = os.path.join(base_output_dir, f"phi3_{device_type}_adapter_{timestamp}")
     
     if device_type == "tpu" and TPU_AVAILABLE:
         # Ensure TPU operations complete before saving
@@ -1413,13 +1428,28 @@ try:
                 except Exception as save_error:
                     logger.error(f"Error saving adapter: {save_error}")
             
+            # Create a small metadata file with training info
+            try:
+                with open(os.path.join(model_output_path, "training_info.json"), "w") as f:
+                    json.dump({
+                        "model_name": MODEL_NAME,
+                        "device_type": device_type,
+                        "tpu_cores": xm.xrt_world_size() if TPU_AVAILABLE else 0,
+                        "batch_size": BATCH_SIZE,
+                        "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+                        "timestamp": timestamp
+                    }, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Could not save training metadata: {e}")
+                
             logger.info("Model saved successfully")
         
         # Final TPU synchronization
         xm.rendezvous("training_complete")
     else:
-        # For GPU/CPU we can save directly
+        # For GPU/CPU we can save directly without TPU-specific handling
         trainer.save_model(model_output_path)
+        logger.info(f"Saved model to {model_output_path}")
         
         # Save adapter separately for easier loading
         if hasattr(model, "save_pretrained"):
@@ -1429,6 +1459,20 @@ try:
             except Exception as save_error:
                 logger.error(f"Error saving adapter: {save_error}")
         
+        # Create a small metadata file with training info
+        try:
+            with open(os.path.join(model_output_path, "training_info.json"), "w") as f:
+                json.dump({
+                    "model_name": MODEL_NAME,
+                    "device_type": device_type,
+                    "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                    "batch_size": BATCH_SIZE,
+                    "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+                    "timestamp": timestamp
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save training metadata: {e}")
+            
         logger.info("Model saved successfully")
     
     logger.info(f"{device_type.upper()} training complete")
@@ -1449,20 +1493,29 @@ except Exception as e:
         for i in range(torch.cuda.device_count()):
             logger.info(f"GPU {i} memory: {torch.cuda.memory_allocated(i) / 1024 / 1024:.2f} MB allocated")
     
-    # Try to save checkpoint if possible
+    # Try to save checkpoint if possible - with platform-agnostic path
     try:
         logger.info("\nAttempting to save emergency checkpoint...")
-        emergency_path = f"./phi3_{device_type}_swift_model_emergency_checkpoint"
+        
+        # Use universal path structure that works on all platforms
+        base_output_dir = os.path.join(".", "models", "emergency")
+        os.makedirs(base_output_dir, exist_ok=True)
+        
+        # Use timestamp for unique emergency checkpoint name
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        emergency_path = os.path.join(base_output_dir, f"phi3_{device_type}_emergency_{timestamp}")
         
         if device_type == "tpu" and TPU_AVAILABLE:
             if xm.is_master_ordinal():
                 trainer.save_model(emergency_path)
+                logger.info(f"Emergency checkpoint saved to {emergency_path}")
         else:
             trainer.save_model(emergency_path)
+            logger.info(f"Emergency checkpoint saved to {emergency_path}")
             
-        logger.info(f"Emergency checkpoint saved to {emergency_path}")
     except Exception as save_error:
         logger.error(f"Could not save emergency checkpoint: {save_error}")
+        logger.error(traceback.format_exc())
     
     # Monitor resources after error
     logger.info("Resources after error:")
