@@ -683,8 +683,6 @@ try:
     
     # Configure LoRA for efficient fine-tuning
     print("Setting up LoRA fine-tuning...")
-    # Get label names from category names
-    label_names = [category_names[i] for i in range(len(category_names))]
     
     lora_config = LoraConfig(
         r=LORA_R,
@@ -692,8 +690,7 @@ try:
         lora_dropout=LORA_DROPOUT,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        label_names=label_names
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
     
     # Prepare the model for training - crucial for memory efficiency
