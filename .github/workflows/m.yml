@@ -1,9 +1,7 @@
 name: Convert Python Script to Jupyter Notebook
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
     paths:
       - 'Training/Train-Phi3-4bit.py'
 
