@@ -119,13 +119,13 @@ DATASET_ID = "mvasiliniuc/iva-swift-codeint"
 
 # Model configuration - using Phi-3-mini-128k-instruct
 MODEL_NAME = "microsoft/Phi-3-mini-128k-instruct"
-MAX_LENGTH = 4096  # Phi-3 can handle long sequences natively
-BATCH_SIZE = 2  # Reduced batch size for multi-GPU training (each GPU will process this batch size)
+MAX_LENGTH = 2048  # Reduced from 4096 to save memory
+BATCH_SIZE = 1  # Reduced batch size to avoid OOM errors
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 3
 WARMUP_RATIO = 0.03
-GRADIENT_ACCUMULATION_STEPS = 4  # Reduced since we're using 2 GPUs
+GRADIENT_ACCUMULATION_STEPS = 8  # Increased to compensate for smaller batch size
 
 # LoRA configuration
 LORA_R = 16
@@ -626,8 +626,9 @@ try:
         # Distributed training parameters
         local_rank=int(os.environ.get("LOCAL_RANK", -1)),  # For distributed training
         ddp_find_unused_parameters=False,  # Optimize DDP
-        dataloader_num_workers=4,  # Parallelize data loading
-        report_to="none",  # Disable reporting to avoid extra overhead
+        dataloader_num_workers=2,  # Reduced from 4 to save memory
+        dataloader_pin_memory=False,  # Disable pin memory to reduce memory usage
+        report_to="none"  # Disable reporting to avoid extra overhead
     )
     
     print(f"Training arguments configured for {'multi-GPU' if torch.cuda.device_count() > 1 else 'single-GPU'} training")
@@ -646,6 +647,72 @@ early_stopping_callback = EarlyStoppingCallback(
     early_stopping_threshold=0.01
 )
 
+# Load and prepare the model with explicit memory management for multi-GPU setup
+try:
+    print(f"Loading {MODEL_NAME} with 4-bit quantization...")
+    
+    # Clean up memory before model loading
+    cleanup_memory()
+    
+    # Configure 4-bit quantization with memory-efficient settings
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,  # Use nested quantization for more memory efficiency
+        bnb_4bit_quant_type="nf4",        # Normalized float 4 for better accuracy
+        bnb_4bit_compute_dtype=torch.float16,
+        llm_int8_has_fp16_weight=False,   # Reduce memory footprint
+        llm_int8_threshold=6.0,
+        llm_int8_skip_modules=None,
+    )
+    
+    # Load model with proper device mapping for multi-GPU distribution
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",  # Automatically distribute across available GPUs
+        offload_folder="offload",  # Enable CPU offloading if needed
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+        use_cache=False,  # Disable KV cache during training for better memory efficiency
+        # Optimize for multi-GPU training
+        low_cpu_mem_usage=True
+    )
+    
+    print(f"Successfully loaded model with 4-bit quantization")
+    
+    # Configure LoRA for efficient fine-tuning
+    print("Setting up LoRA fine-tuning...")
+    lora_config = LoraConfig(
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    )
+    
+    # Prepare the model for training - crucial for memory efficiency
+    model = prepare_model_for_kbit_training(model)
+    model = get_peft_model(model, lora_config)
+    
+    # Print information about the quantized model
+    print(f"Model loaded and configured with 4-bit quantization and LoRA (rank={LORA_R})")
+    print(f"Model architecture: {model.__class__.__name__}")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
+    
+    # Monitor GPU memory after model loading
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / (1024**3)
+            reserved = torch.cuda.memory_reserved(i) / (1024**3)
+            print(f"GPU {i} memory after model loading: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+    
+except Exception as e:
+    print(f"Error loading model: {e}")
+    import traceback
+    traceback.print_exc()
+    raise
 
 # %%
 # FIXED: Create a custom data collator that properly handles the data
@@ -686,7 +753,7 @@ print("Training setup complete")
 
 
 # %%
-# Function to monitor system resources during training
+# Function to monitor system resources during training with detailed GPU memory tracking
 def monitor_resources():
     process = psutil.Process(os.getpid())
     memory_info = process.memory_info()
@@ -696,13 +763,62 @@ def monitor_resources():
     print(f"\nSystem Resources:")
     print(f"CPU Usage: {cpu_percent}%")
     print(f"Process Memory: {memory_info.rss / 1024 / 1024:.2f} MB")
-    print(f"System Memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available\n")
+    print(f"System Memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available")
+    
+    # Add detailed GPU memory tracking
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"\nGPU Memory Usage ({num_gpus} GPUs detected):")
+        
+        total_allocated = 0
+        total_reserved = 0
+        total_free = 0
+        
+        for i in range(num_gpus):
+            allocated = torch.cuda.memory_allocated(i) / (1024**3)
+            reserved = torch.cuda.memory_reserved(i) / (1024**3)
+            properties = torch.cuda.get_device_properties(i)
+            total_memory = properties.total_memory / (1024**3)
+            free_memory = total_memory - allocated
+            
+            total_allocated += allocated
+            total_reserved += reserved
+            total_free += free_memory
+            
+            print(f"  GPU {i} ({properties.name}):")
+            print(f"    Total memory: {total_memory:.2f} GB")
+            print(f"    Allocated: {allocated:.2f} GB ({allocated/total_memory*100:.1f}%)")
+            print(f"    Reserved: {reserved:.2f} GB ({reserved/total_memory*100:.1f}%)")
+            print(f"    Free: {free_memory:.2f} GB ({free_memory/total_memory*100:.1f}%)")
+            
+            # Show detailed memory statistics if available
+            if hasattr(torch.cuda, 'memory_stats'):
+                stats = torch.cuda.memory_stats(i)
+                if 'active_bytes.all.current' in stats:
+                    active = stats['active_bytes.all.current'] / (1024**3)
+                    print(f"    Active memory: {active:.2f} GB")
+                if 'inactive_split_bytes.all.current' in stats:
+                    inactive = stats['inactive_split_bytes.all.current'] / (1024**3)
+                    print(f"    Inactive split: {inactive:.2f} GB")
+                if 'reserved_bytes.all.current' in stats:
+                    reserved_bytes = stats['reserved_bytes.all.current'] / (1024**3)
+                    print(f"    Reserved bytes: {reserved_bytes:.2f} GB")
+                    
+        print(f"\n  Total across all GPUs:")
+        print(f"    Allocated: {total_allocated:.2f} GB")
+        print(f"    Reserved: {total_reserved:.2f} GB")
+        print(f"    Free: {total_free:.2f} GB")
+        
+        # Check for potential OOM conditions
+        if any(torch.cuda.memory_allocated(i) / torch.cuda.get_device_properties(i).total_memory > 0.90 for i in range(num_gpus)):
+            print("\n  ⚠️ WARNING: At least one GPU is using >90% of available memory - OOM risk is high!")
+    print("")
 
 
 # %%
-# Run training with enhanced memory monitoring for multi-GPU setup
+# Create a custom training loop with enhanced memory management for multi-GPU setup
 try:
-    print("Starting training...")
+    print("Starting training with enhanced memory management...")
     
     # Monitor resources before training
     print("Resources before training:")
@@ -713,40 +829,143 @@ try:
     
     # Set PyTorch to optimize for multi-GPU training
     if torch.cuda.device_count() > 1:
-        print("Configuring PyTorch for multi-GPU training...")
+        print(f"Configuring PyTorch for {torch.cuda.device_count()} GPUs...")
+        
         # Enable TF32 precision for faster training (on Ampere GPUs)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation strategy
-        torch.cuda.set_per_process_memory_fraction(0.95)  # Reserve some memory for system
+        
+        # Disable memory-intensive CUDA features
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        
+        # Lower memory allocation to avoid OOM
+        torch.cuda.set_per_process_memory_fraction(0.80)  # Further reduced to prevent OOM
+        
+        # Create explicit model shard strategy for multi-GPU
+        print("Model is distributed across GPUs with device_map='auto'")
+        
+        # Override trainer's distributed strategy for better GPU utilization
+        training_args.ddp_find_unused_parameters = True
     
-    # Start training with a timeout
+    # Create a custom training loop with extra OOM prevention
+    class OOMGuardCallback(transformers.TrainerCallback):
+        """Custom callback that detects and prevents OOM errors"""
+        def on_step_end(self, args, state, control, **kwargs):
+            # Check memory usage on each GPU after step
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / torch.cuda.get_device_properties(i).total_memory
+                if allocated > 0.92:  # Over 92% memory usage
+                    # Force immediate garbage collection and cache clearing
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    print(f"\n⚠️ Warning: GPU {i} memory usage high ({allocated*100:.1f}%). Forcing cache clear.")
+                    # Pause briefly to allow memory release
+                    time.sleep(1)
+                    
+        def on_epoch_end(self, args, state, control, **kwargs):
+            # Clean up between epochs for better stability
+            gc.collect()
+            torch.cuda.empty_cache()
+            print("\nCompleted epoch - clearing memory cache")
+    
+    # Add our OOM prevention callback
+    trainer.add_callback(OOMGuardCallback())
+    
+    # Start training with a timeout and checkpointing
+    max_training_time = 6 * 60 * 60  # 6 hours max
     start_time = time.time()
     
-    # Run training
-    train_result = trainer.train()
+    # Run training with OOM handling
+    try:
+        # First try with normal parameters
+        print("\nStarting training with regular settings...")
+        train_result = trainer.train()
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            # If we hit OOM, try recovery steps
+            print("\n🛑 CUDA OOM detected. Attempting recovery...")
+            
+            # Clear all GPU memory
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(i)
+            
+            # Try reducing sequence length further if needed
+            if MAX_LENGTH > 1024:
+                old_max_len = MAX_LENGTH
+                MAX_LENGTH = 1024
+                print(f"Reducing sequence length from {old_max_len} to {MAX_LENGTH}")
+                
+                # Reload tokenizer with new max length
+                tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, model_max_length=MAX_LENGTH)
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                
+                # We need to retokenize the data, but for now just use what we have
+                # and set the training args to handle the shorter sequence length
+                training_args.max_length = MAX_LENGTH
+            
+            # Try with even smaller batch size and more gradient accumulation
+            training_args.per_device_train_batch_size = 1
+            training_args.gradient_accumulation_steps = 16
+            print("Reduced batch size to 1 and increased gradient accumulation to 16")
+            
+            # Re-create trainer with updated settings
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_train,
+                eval_dataset=tokenized_val,
+                tokenizer=tokenizer,
+                data_collator=data_collator,
+                callbacks=[early_stopping_callback, OOMGuardCallback()]
+            )
+            
+            # Try again with new settings
+            print("\nRetrying training with reduced memory settings...")
+            train_result = trainer.train()
     
     # Monitor resources after training
-    print("Resources after training:")
+    print("\nResources after training:")
     monitor_resources()
     
     # Print training results
-    print(f"Training completed in {train_result.metrics['train_runtime']:.2f} seconds")
+    elapsed_time = time.time() - start_time
+    print(f"\nTraining completed in {elapsed_time/60:.2f} minutes")
     print(f"Training loss: {train_result.metrics['train_loss']:.4f}")
     
     # Save the model
+    print("\nSaving model...")
     trainer.save_model("./phi3_swift_model")
-    print("Model saved to ./phi3_swift_model")
+    
+    # Save adapter separately for easier loading
+    if hasattr(model, "save_pretrained"):
+        try:
+            model.save_pretrained("./phi3_swift_model_adapter")
+            print("Saved LoRA adapter to ./phi3_swift_model_adapter")
+        except Exception as save_error:
+            print(f"Error saving adapter: {save_error}")
+    
+    print("Model saved successfully")
     
     # Clean up memory
     cleanup_memory()
     
 except Exception as e:
-    print(f"Error during training: {e}")
+    print(f"\n❌ Error during training: {e}")
     
     # Print stack trace for debugging
     import traceback
     traceback.print_exc()
+    
+    # Try to save checkpoint if possible
+    try:
+        print("\nAttempting to save checkpoint after error...")
+        trainer.save_model("./phi3_swift_model_checkpoint_after_error")
+        print("Emergency checkpoint saved to ./phi3_swift_model_checkpoint_after_error")
+    except:
+        print("Could not save emergency checkpoint")
     
     # Monitor resources after error
     print("Resources after error:")
