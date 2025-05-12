@@ -51,7 +51,29 @@ print("Starting Phi-3 training pipeline...")
 # %%
 # SECTION 1: SETUP - Install required libraries and configure environment
 print("📦 Installing required libraries...")
-!pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
+
+# First, install bitsandbytes with multi-backend support for CPU offloading during training
+print("👉 Installing BitsAndBytes with multi-backend support for CPU offloading...")
+!pip uninstall -y bitsandbytes  # Remove any existing installation
+!pip install git+https://github.com/TimDettmers/bitsandbytes.git  # Install latest version
+!pip install --upgrade transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft
+
+# Verify bitsandbytes installation for training with offloading
+print("👉 Verifying BitsAndBytes installation...")
+try:
+    import bitsandbytes as bnb
+    print(f"✓ BitsAndBytes version: {bnb.__version__}")
+    # Check if compiled with CUDA support
+    if hasattr(bnb, "COMPILED_WITH_CUDA"):
+        print(f"✓ Compiled with CUDA: {bnb.COMPILED_WITH_CUDA}")
+    # Check for multi-backend support
+    if "get_available_modules" in dir(bnb) or "has_cuda_extension" in dir(bnb.cuda):
+        print("✓ Multi-backend support detected")
+    print("BitsAndBytes installation looks good!")
+except ImportError as e:
+    print(f"⚠️ BitsAndBytes import failed: {e}")
+    print("Installing fallback version...")
+    !pip install bitsandbytes
 
 # Set PyTorch memory management environment variables to avoid fragmentation and OOM issues
 import os
@@ -63,6 +85,8 @@ os.environ["ACCELERATE_USE_CPU_OFFLOAD"] = "1"
 os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
 # Enable disk offloading if needed
 os.environ["ACCELERATE_ENABLE_DISK_OFFLOAD"] = "1"
+# Enable training with CPU offloading
+os.environ["BNB_OFFLOAD_TRAINING"] = "1"  # Critical for training with CPU offload
 
 # Update execution status
 if 'update_status' in globals():
@@ -1119,40 +1143,51 @@ except Exception as e:
     QUANT_BITS = 4
     USING_AQLM = False
     
-    # Enhanced BitsAndBytes 4-bit quantization with memory optimizations
+    # BitsAndBytes 4-bit quantization with CPU offloading for training
+    # Note: This requires the multi-backend version of BitsAndBytes we installed earlier
+    print("Using 4-bit quantization with CPU offloading support for training")
+    
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
+        # Add CPU offloading settings for training
         bnb_4bit_compute_dtype_for_cpu_offload=torch.float32,
+        # Additional settings to help with CPU offloaded training
+        llm_int8_enable_fp32_cpu_offload=True,  # Critical for CPU offloading during training
+        llm_int8_has_fp16_weight=True,  # Help with mixed precision during offloading
+        llm_int8_threshold=6.0  # Adjust threshold for better quantization quality
     )
     
-    # Load model for GPU or CPU with memory optimizations
-    if USE_CPU_OFFLOAD:
-        print("Using CPU offloading with BitsAndBytes quantization...")
-        
-        # First initialize with empty weights to avoid OOM during loading
-        with init_empty_weights():
-            config = AutoModelForCausalLM.from_pretrained(
-                MODEL_NAME, 
-                trust_remote_code=True,
-                return_dict=True
-            )
-            # Add memory-efficient attention method to config if available
-            if USE_MEMORY_EFFICIENT_ATTENTION and hasattr(config, "attention_implementation"):
-                print("Enabling memory-efficient attention...")
-                config.attention_implementation = "flash_attention_2"
-        
-        # Custom device map for aggressive offloading
-        offload_folder = OFFLOAD_FOLDER if USE_SEQUENTIAL_OFFLOAD else None
-        
-        # Create custom device map for offloading
-        device_map = {
-            "model.embed_tokens": 0,  # Keep embeddings on GPU 0
-            "model.norm": 0,          # Keep normalization on GPU 0
-            "lm_head": 0,             # Keep LM head on GPU 0
-        }
+    # We'll use hybrid GPU/CPU configuration with multi-backend BitsAndBytes support
+    print("Initializing with CPU offloading for multi-backend BitsAndBytes training...")
+    
+    # First initialize with empty weights to avoid OOM during loading
+    with init_empty_weights():
+        config = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME, 
+            trust_remote_code=True,
+            return_dict=True
+        )
+        # Add memory-efficient attention method to config if available
+        if USE_MEMORY_EFFICIENT_ATTENTION and hasattr(config, "attention_implementation"):
+            print("Enabling memory-efficient attention...")
+            config.attention_implementation = "flash_attention_2"
+    
+    # Create hybrid device map that allows CPU offloading with multi-backend BitsAndBytes
+    offload_folder = OFFLOAD_FOLDER if USE_SEQUENTIAL_OFFLOAD else None
+    print(f"Using offload folder: {offload_folder}")
+    
+    # Configure device map for multi-backend BitsAndBytes training
+    device_map = {
+        "model.embed_tokens": 0,  # Keep embeddings on GPU 0
+        "model.norm": 0,          # Keep normalization on GPU 0
+        "lm_head": 0,             # Keep LM head on GPU 0
+    }
+    
+    # Set additional environment variables specific to bitsandbytes multi-backend training
+    os.environ["BNB_ENABLE_TRAINING_OFFLOAD"] = "1"  # Critical for bitsandbytes multi-backend support
         
         # Distribute layers across devices with CPU/disk offloading
         # Get number of layers with compatibility for different model types
@@ -1205,9 +1240,12 @@ except Exception as e:
                 n_layers = 24
                 print(f"Warning: Could not determine number of layers, using default: {n_layers}")
         
-        gpu0_layers = n_layers // 3   # 33% on GPU 0
-        gpu1_layers = n_layers // 3   # 33% on GPU 1
-        cpu_layers = n_layers - gpu0_layers - gpu1_layers  # 34% on CPU with potential disk offload
+        # With multi-backend BitsAndBytes, we can use CPU offloading for training
+        # Split layers across GPUs and CPU optimally
+        gpu0_layers = n_layers // 3      # ~33% on GPU 0
+        gpu1_layers = n_layers // 3      # ~33% on GPU 1
+        cpu_layers = n_layers - gpu0_layers - gpu1_layers  # ~34% on CPU with offloading
+        print(f"Using hybrid configuration with multi-backend BitsAndBytes: {gpu0_layers} layers on GPU 0, {gpu1_layers} layers on GPU 1, {cpu_layers} layers on CPU")
         
         # Determine the correct layer naming pattern for different model architectures
         # For Phi-3 models, the pattern might be different than standard transformers
@@ -1315,13 +1353,19 @@ except Exception as e:
             # Try again with much simpler configuration optimized for Kaggle
             print("Using simplified auto device mapping for maximum compatibility...")
             
-            # Create simpler BnB config for auto device mapping
+            # Create simpler BnB config with multi-backend support for auto device mapping
             simple_bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True
+                bnb_4bit_use_double_quant=True,
+                # Keep multi-backend support even in fallback mode
+                llm_int8_enable_fp32_cpu_offload=True,
+                llm_int8_has_fp16_weight=True
             )
+            
+            # Set multi-backend environment variables for fallback as well
+            os.environ["BNB_ENABLE_TRAINING_OFFLOAD"] = "1"
             
             # Kaggle-optimized max memory settings - be very conservative
             kaggle_max_memory = {
