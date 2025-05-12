@@ -147,14 +147,22 @@ import sys
 import json
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer, 
-    TrainingArguments, 
-    Trainer, 
-    DataCollatorForLanguageModeling,
-    BitsAndBytesConfig
-)
+
+# Disable torchvision requirement in transformers
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"  # Temporarily set offline to avoid some imports
+
+# Import transformers components individually to avoid problematic dependencies
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.training_args import TrainingArguments
+from transformers.trainer import Trainer
+from transformers.data.data_collator import DataCollatorForLanguageModeling
+from transformers.utils.quantization_config import BitsAndBytesConfig
+
+# Reset offline mode after imports
+os.environ.pop("TRANSFORMERS_OFFLINE", None)
+
 from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 # Import GGUF for model quantization
@@ -182,6 +190,11 @@ try:
 except Exception as e:
     print(f"Error importing GGUF libraries: {e}")
     print("Will fallback to 4-bit quantization using BitsAndBytes")
+
+# Check if torchvision is imported and unload it if it is
+if 'torchvision' in sys.modules:
+    print("Removing torchvision from loaded modules as it's not needed")
+    del sys.modules['torchvision']
 
 # Define Kaggle-optimized memory cleanup function
 def cleanup_memory():
@@ -876,6 +889,37 @@ except Exception as e:
     raise
 
 # %%
+# Add a monkey patch to handle potential torchvision imports later in the code
+def monkey_patch_transformers():
+    """Apply monkey patches to avoid torchvision dependencies in transformers"""
+    try:
+        import transformers
+        
+        # Create a fake NMS function if needed
+        def dummy_nms(*args, **kwargs):
+            print("Dummy NMS function called - this shouldn't affect language model training")
+            # Return empty tensor
+            return torch.tensor([], dtype=torch.int64)
+        
+        # Try to patch torch._C._dispatch_has_kernel_for_dispatch_key to avoid the error
+        if hasattr(torch, '_C') and hasattr(torch._C, '_dispatch_has_kernel_for_dispatch_key'):
+            original_fn = torch._C._dispatch_has_kernel_for_dispatch_key
+            
+            def patched_dispatch_check(op_name, dispatch_key):
+                if 'torchvision::nms' in op_name:
+                    return False  # Pretend this operator doesn't exist
+                return original_fn(op_name, dispatch_key)
+            
+            torch._C._dispatch_has_kernel_for_dispatch_key = patched_dispatch_check
+            print("Applied torch dispatch check patch to avoid torchvision dependency")
+            
+    except Exception as e:
+        print(f"Warning: Could not apply transformers monkey patch: {e}")
+        print("Will continue anyway, but may encounter torchvision-related errors")
+
+# Apply the monkey patch
+monkey_patch_transformers()
+
 # Set up training arguments with optimized settings for multi-GPU training
 try:
     # Create output directory if it doesn't exist
@@ -1448,6 +1492,10 @@ print("🔧 Creating trainer and configuring training parameters...")
 
 # Create trainer with memory optimizations for GPU/CPU
 print("Setting up memory-optimized trainer...")
+
+# Apply monkey patch one more time before creating the trainer to ensure we avoid torchvision dependency
+if 'monkey_patch_transformers' in globals():
+    monkey_patch_transformers()
 
 # Add additional memory optimization callbacks
 from transformers.trainer_callback import TrainerCallback
