@@ -8,12 +8,11 @@ specifically for Swift programming language capabilities. It provides both quant
 and qualitative examples to measure how much the model has learned.
 
 Usage:
-    python evaluate_phi3_models.py --finetuned_model "YOUR_MODEL_NAME" [--original_model "microsoft/Phi-3-mini-128k-instruct"] 
-                                   [--quantization_bits 4] [--quantization_method "BitsAndBytes"] 
-                                   [--output_dir "./evaluation_results"]
+    python Evaluation.py --finetuned_model "YOUR_MODEL_NAME" [--original_model "microsoft/Phi-3-mini-128k-instruct"] 
+                        [--output_dir "./evaluation_results"]
 
 Example:
-    python evaluate_phi3_models.py --finetuned_model "yourusername/phi3-swift-finetuned" --quantization_bits 4
+    python Evaluation.py --finetuned_model "yourusername/phi3-swift-finetuned"
 """
 
 import os
@@ -28,18 +27,8 @@ from tqdm import tqdm
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM, 
-    AutoTokenizer, 
-    BitsAndBytesConfig
+    AutoTokenizer
 )
-
-# Try to import AQLM for 2-bit quantization
-try:
-    import aqlm
-    AQLM_AVAILABLE = True
-    print("AQLM package found - 2-bit quantization available")
-except ImportError:
-    AQLM_AVAILABLE = False
-    print("AQLM package not found - only 4-bit quantization available with BitsAndBytes")
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -57,22 +46,6 @@ def parse_arguments():
         type=str,
         default="microsoft/Phi-3-mini-128k-instruct",
         help="HuggingFace model ID of the original model to compare against"
-    )
-    
-    # Quantization arguments
-    parser.add_argument(
-        "--quantization_bits", 
-        type=int, 
-        default=4,
-        choices=[2, 4, 8, 16],
-        help="Number of bits for quantization (2 requires AQLM, 4 uses BitsAndBytes)"
-    )
-    parser.add_argument(
-        "--quantization_method", 
-        type=str,
-        default="auto",
-        choices=["auto", "AQLM", "BitsAndBytes", "none"],
-        help="Quantization method to use (auto will use AQLM for 2-bit if available, BitsAndBytes for 4-bit)"
     )
     
     # Dataset and evaluation arguments
@@ -132,23 +105,14 @@ def setup_device():
         
     return device, use_device_map
 
-def load_model(model_name, quantization_bits, quantization_method, use_device_map, device):
-    """Load a model with the specified quantization."""
+def load_model(model_name, use_device_map, device):
+    """Load a model directly without quantization."""
     print(f"Loading model: {model_name}")
     
     if not model_name:
         raise ValueError("Model name cannot be empty. Please provide a valid model name.")
     
-    # Determine quantization method if set to auto
-    if quantization_method == "auto":
-        if quantization_bits == 2 and AQLM_AVAILABLE:
-            quantization_method = "AQLM"
-        elif quantization_bits == 4:
-            quantization_method = "BitsAndBytes"
-        else:
-            quantization_method = "none"
-    
-    # Set up loading configuration
+    # Set up tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -156,84 +120,18 @@ def load_model(model_name, quantization_bits, quantization_method, use_device_ma
     # Configure the device map
     device_map = "auto" if use_device_map else None
     
-    # Load the model with the specified quantization
-    if quantization_method == "AQLM" and quantization_bits == 2:
-        if not AQLM_AVAILABLE:
-            raise ImportError("AQLM package is required for 2-bit quantization but not found.")
-        
-        print(f"Loading model with AQLM {quantization_bits}-bit quantization...")
-        
-        # First load the base model
-        base_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map=device_map,
-            trust_remote_code=True,
-            use_cache=True,
-            low_cpu_mem_usage=True
-        )
-        
-        # Apply AQLM quantization
-        try:
-            if hasattr(aqlm, 'quantize'):
-                quantize_fn = aqlm.quantize
-            elif hasattr(aqlm, 'quantization') and hasattr(aqlm.quantization, 'quantize'):
-                quantize_fn = aqlm.quantization.quantize
-            else:
-                # Try to discover the correct module
-                for module_name in dir(aqlm):
-                    module = getattr(aqlm, module_name)
-                    if hasattr(module, 'quantize'):
-                        quantize_fn = module.quantize
-                        break
-                else:
-                    raise ImportError("Could not find quantize function in AQLM modules")
-            
-            # Apply quantization with default settings
-            model = quantize_fn(
-                base_model, 
-                bits=quantization_bits,
-                lora_rank=16  # Default LoRA rank value
-            )
-            print(f"Successfully loaded model with AQLM {quantization_bits}-bit quantization")
-            
-        except Exception as e:
-            print(f"Failed to apply AQLM quantization: {e}")
-            print("Falling back to BitsAndBytes 4-bit quantization")
-            quantization_method = "BitsAndBytes"
-            quantization_bits = 4
+    # Load the model directly
+    print(f"Loading model {model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map=device_map,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+        use_cache=True
+    )
+    print(f"Successfully loaded model {model_name}")
     
-    if quantization_method == "BitsAndBytes":
-        print(f"Loading model with BitsAndBytes {quantization_bits}-bit quantization...")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True
-        )
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            use_cache=True
-        )
-        print(f"Successfully loaded model with BitsAndBytes {quantization_bits}-bit quantization")
-    
-    elif quantization_method == "none":
-        print("Loading model without quantization...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map=device_map,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            use_cache=True
-        )
-        print("Successfully loaded model without quantization")
-    
-    return model, tokenizer, {"method": quantization_method, "bits": quantization_bits}
+    return model, tokenizer
 
 def prepare_swift_benchmark():
     """Define a structured benchmark for Swift programming tasks."""
@@ -388,19 +286,15 @@ def run_model_evaluation(args):
     
     try:
         # Load fine-tuned model
-        finetuned_model, tokenizer, quant_config = load_model(
+        finetuned_model, tokenizer = load_model(
             args.finetuned_model, 
-            args.quantization_bits,
-            args.quantization_method,
             use_device_map,
             device
         )
         
-        # Load original model with same quantization for fair comparison
-        original_model, _, _ = load_model(
+        # Load original model for comparison
+        original_model, _ = load_model(
             args.original_model,
-            args.quantization_bits,
-            args.quantization_method,
             use_device_map,
             device
         )
@@ -633,12 +527,10 @@ def run_model_evaluation(args):
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "models": {
             "finetuned": {
-                "name": args.finetuned_model,
-                "quantization": quant_config
+                "name": args.finetuned_model
             },
             "original": {
-                "name": args.original_model,
-                "quantization": quant_config
+                "name": args.original_model
             }
         },
         "benchmark_results": [
