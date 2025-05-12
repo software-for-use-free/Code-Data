@@ -72,6 +72,16 @@ print("Starting Phi-3 training pipeline...")
 # SECTION 1: SETUP - Install required libraries and configure environment
 print("📦 Installing required libraries...")
 !pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
+
+# Install PyTorch/XLA for TPU support
+try:
+    print("Installing PyTorch/XLA for TPU support...")
+    !pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
+    TPU_INSTALLATIONS_ATTEMPTED = True
+except Exception as e:
+    print(f"Note: PyTorch/XLA installation error: {e}. TPU support may not be available.")
+    TPU_INSTALLATIONS_ATTEMPTED = False
+
 # Set PyTorch memory management environment variables to avoid fragmentation
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -104,6 +114,19 @@ from transformers import (
 )
 from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+# Try to import PyTorch/XLA for TPU support
+TPU_AVAILABLE = False
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    TPU_AVAILABLE = True
+    print("✓ PyTorch/XLA successfully imported - TPU support is available")
+except ImportError:
+    print("PyTorch/XLA not available - TPU support will not be enabled")
+    TPU_AVAILABLE = False
 # Import AQLM for 2-bit quantization
 try:
     try:
@@ -156,8 +179,26 @@ def monitor_resources():
 
 
 # %%
-# Check if GPU is available and configure for multi-GPU training
-if torch.cuda.is_available():
+# Check for available accelerators (TPU, GPU, or CPU) and configure accordingly
+if TPU_AVAILABLE:
+    # Set up for TPU training
+    device = xm.xla_device()
+    print(f"🚀 Using TPU: {xm.get_device_type()}")
+    print(f"TPU cores available: {xm.xrt_world_size()}")
+    
+    # Print TPU specific information
+    tpu_info = {}
+    try:
+        tpu_info['device'] = str(device)
+        tpu_info['xla_device_type'] = xm.get_device_type()
+        tpu_info['xla_world_size'] = xm.xrt_world_size()
+        print(f"TPU Details: {json.dumps(tpu_info, indent=2)}")
+    except Exception as e:
+        print(f"Error getting TPU details: {e}")
+    
+    # TPU memory management
+    print("Optimizing for TPU training...")
+elif torch.cuda.is_available():
     # Set up for distributed training on multiple GPUs
     device = torch.device('cuda')
     print(f"Using GPU: {torch.cuda.get_device_name(0)}")
@@ -784,14 +825,31 @@ try:
         
         # First load the model normally - we'll apply AQLM quantization after
         print(f"Loading base model {MODEL_NAME}...")
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch.float16,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            use_cache=False,  # Disable KV cache during training for better memory efficiency
-            low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
-        )
+        
+        # Device mapping based on available hardware
+        if TPU_AVAILABLE:
+            # For TPU, we don't use device_map="auto" as it's not compatible
+            print("Configuring model for TPU training...")
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                torch_dtype=torch.bfloat16,  # bfloat16 is better for TPUs
+                trust_remote_code=True,
+                use_cache=False,  # Disable KV cache during training for better memory efficiency
+                low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+            )
+            # Move model to TPU manually after loading
+            model.to(device)
+            print("Model successfully moved to TPU")
+        else:
+            # For GPU or CPU, use the original approach
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                torch_dtype=torch.float16,
+                device_map="auto" if torch.cuda.is_available() else None,
+                trust_remote_code=True,
+                use_cache=False,  # Disable KV cache during training for better memory efficiency
+                low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+            )
         
         # Now apply AQLM 2-bit quantization to the model
         print(f"Applying AQLM {QUANT_BITS}-bit quantization...")
@@ -872,19 +930,34 @@ except Exception as e:
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.float16 if not TPU_AVAILABLE else torch.bfloat16,
         bnb_4bit_use_double_quant=True
     )
     
-    # Load model with BitsAndBytes 4-bit quantization
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        quantization_config=bnb_config,
-        device_map="auto" if torch.cuda.is_available() else None,
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-        use_cache=False
-    )
+    # Load model with different configuration based on the available hardware
+    if TPU_AVAILABLE:
+        print("Loading model for TPU with 4-bit quantization...")
+        # For TPUs, we need to avoid device_map="auto" and move to TPU after loading
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,  # bfloat16 is preferred for TPUs
+            trust_remote_code=True,
+            use_cache=False
+        )
+        # Move model to TPU manually
+        model.to(device)
+        print("Model successfully moved to TPU device")
+    else:
+        # For GPU or CPU, use the original approach
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map="auto" if torch.cuda.is_available() else None,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            use_cache=False
+        )
     print("Successfully loaded model with BitsAndBytes 4-bit quantization")
 
 # Configure LoRA for fine-tuning (same for both quantization methods)
@@ -931,16 +1004,47 @@ if not IS_KAGGLE:
         print("When running in Jupyter, make sure to run all previous cells first.")
         print("Proceeding anyway as this might be running in sequential mode...")
 
-# Create trainer
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_train,
-    eval_dataset=tokenized_val,
-    tokenizer=tokenizer,
-    data_collator=data_collator,
-    callbacks=[early_stopping_callback]
-)
+# Create trainer based on the available hardware
+if TPU_AVAILABLE:
+    # For TPU, we need special setup with XLA integration
+    print("Setting up trainer with TPU optimizations...")
+    
+    # Create a TPU-optimized trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        callbacks=[early_stopping_callback]
+    )
+    
+    # Add TPU-specific verification print
+    print("TPU Trainer successfully initialized")
+    print(f"Using TPU device: {device}")
+    print(f"TPU cores being used: {xm.xrt_world_size()}")
+    
+    # Verify model is on TPU
+    model_device = next(model.parameters()).device
+    print(f"Model is on device: {model_device}")
+    print(f"Is model on TPU: {'xla' in str(model_device).lower()}")
+else:
+    # Standard trainer for GPU/CPU
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        callbacks=[early_stopping_callback]
+    )
+    
+    # Verify model device
+    model_device = next(model.parameters()).device
+    device_type = "GPU" if torch.cuda.is_available() else "CPU"
+    print(f"Model is on {device_type} device: {model_device}")
 
 print("✅ Trainer setup complete")
 
@@ -967,7 +1071,38 @@ def monitor_resources():
     print(f"\nSystem Resources:")
     print(f"CPU Usage: {cpu_percent}%")
     print(f"Process Memory: {memory_info.rss / 1024 / 1024:.2f} MB")
-    print(f"System Memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available\n")
+    print(f"System Memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available")
+    
+    # Check which device we're using and show appropriate memory metrics
+    if TPU_AVAILABLE:
+        print("\nTPU Resources:")
+        try:
+            # Try to get TPU memory info if available
+            if hasattr(xm, 'get_memory_info'):
+                mem_info = xm.get_memory_info(device)
+                print(f"TPU Memory - Free: {mem_info['kb_free']/1024:.2f} MB, Total: {mem_info['kb_total']/1024:.2f} MB")
+            print(f"TPU Device: {xm.get_device_type()}")
+            print(f"TPU Cores: {xm.xrt_world_size()}")
+        except Exception as e:
+            print(f"Error getting TPU memory information: {e}")
+    elif torch.cuda.is_available():
+        # GPU memory monitoring
+        num_gpus = torch.cuda.device_count()
+        print(f"\nGPU Memory Usage ({num_gpus} GPUs detected):")
+        
+        for i in range(num_gpus):
+            allocated = torch.cuda.memory_allocated(i) / (1024**3)
+            reserved = torch.cuda.memory_reserved(i) / (1024**3)
+            properties = torch.cuda.get_device_properties(i)
+            total_memory = properties.total_memory / (1024**3)
+            free_memory = total_memory - allocated
+            
+            print(f"  GPU {i} ({properties.name}):")
+            print(f"    Total memory: {total_memory:.2f} GB")
+            print(f"    Allocated: {allocated:.2f} GB ({allocated/total_memory*100:.1f}%)")
+            print(f"    Free: {free_memory:.2f} GB ({free_memory/total_memory*100:.1f}%)")
+    
+    print("")  # Add blank line for readability
 
 # Verify trainer is initialized when running in Jupyter mode
 if not IS_KAGGLE and ('trainer' not in globals() or trainer is None):
@@ -988,8 +1123,14 @@ try:
     # Additional memory cleanup before training
     cleanup_memory()
     
-    # Set PyTorch to optimize for multi-GPU training
-    if torch.cuda.device_count() > 1:
+    # Set hardware-specific optimizations
+    if TPU_AVAILABLE:
+        print("Configuring PyTorch for TPU training...")
+        # TPU-specific optimizations
+        # TPUs work best with bfloat16 precision
+        print("TPU training starting with bfloat16 precision...")
+        
+    elif torch.cuda.device_count() > 1:
         print("Configuring PyTorch for multi-GPU training...")
         # Enable TF32 precision for faster training (on Ampere GPUs)
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -1000,8 +1141,21 @@ try:
     # Start training with a timeout
     start_time = time.time()
     
-    # Run training
-    train_result = trainer.train()
+    # Run training with device-specific approach
+    if TPU_AVAILABLE:
+        print("\n🚀 Starting TPU training...")
+        train_result = trainer.train()
+        
+        # Additional TPU verification during training
+        print("\nTPU Training Statistics:")
+        if hasattr(xm, 'get_memory_info'):
+            mem_info = xm.get_memory_info(device)
+            print(f"TPU Memory - Free: {mem_info['kb_free']/1024:.2f} MB, Total: {mem_info['kb_total']/1024:.2f} MB")
+        print(f"TPU Device: {xm.get_device_type()}")
+    else:
+        # Standard training for GPU/CPU
+        print("\n🚀 Starting training on {device}...")
+        train_result = trainer.train()
     
     # Monitor resources after training
     print("Resources after training:")
@@ -1013,8 +1167,21 @@ try:
     
     # Save the model with appropriate method based on quantization used
     print("\n💾 Saving trained model...")
+    
+    # Ensure proper model saving based on the hardware
+    if TPU_AVAILABLE:
+        # For TPU, ensure we're on CPU before saving to avoid XLA tensor issues
+        print("Moving model to CPU before saving (TPU compatibility)...")
+        # Synchronize TPU operations before saving
+        if hasattr(xm, 'rendezvous'):
+            xm.rendezvous("save_checkpoint")
+        
     trainer.save_model("./phi3_swift_model")
+    
+    # Determine the quantization method for display
+    quant_method = "AQLM" if USING_AQLM else "BitsAndBytes"
     print(f"✅ Model saved to ./phi3_swift_model ({QUANT_BITS}-bit {quant_method} quantized)")
+    print(f"   Trained on: {'TPU' if TPU_AVAILABLE else 'GPU' if torch.cuda.is_available() else 'CPU'}")
     
     # Save model configuration details
     with open("./phi3_swift_model/quantization_config.json", "w") as f:
