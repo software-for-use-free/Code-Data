@@ -1,0 +1,47 @@
+name: Convert Notebook to Python Script
+
+on:
+  workflow_dispatch:  # Allows manual triggering of the workflow
+
+jobs:
+  convert-notebook:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'  # Specify Python version (adjust if needed)
+
+      # Step 3: Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nbconvert
+
+      # Step 4: Create Training directory if it doesn't exist
+      - name: Create Training directory
+        run: mkdir -p Training
+
+      # Step 5: Convert Jupyter Notebook to Python script
+      - name: Convert notebook to Python
+        run: |
+          jupyter nbconvert --to script Notebooks/Interface-fine-tune.ipynb --output-dir Training
+          # Rename the output file to remove the .txt extension (nbconvert quirk)
+          mv Training/Interface-fine-tune.txt Training/Interface-fine-tune.py
+
+      # Step 6: Commit and push changes
+      - name: Commit converted script
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add Training/Interface-fine-tune.py
+          git commit -m "Add converted Interface-fine-tune.py script to Training folder" || echo "No changes to commit"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
