@@ -16,20 +16,9 @@
 # # Training Phi-3-mini-128k-instruct to Learn Swift Programming Language
 #
 # This notebook trains Microsoft's Phi-3-mini-128k-instruct model to understand and work with Swift code using a dataset of real Swift files.
-#
-# ## Execution Flow for Kaggle
-# 
-# This notebook is designed to run smoothly on Kaggle or in any Jupyter environment. Cells will execute sequentially in the following order:
-# 
-# 1. Setup and library installation
-# 2. Data preparation
-# 3. Model initialization
-# 4. Trainer setup
-# 5. Training process
-# 6. Model testing
 
 # %%
-# EXECUTION TRACKING SYSTEM - helps ensure proper execution on Kaggle and Jupyter
+# EXECUTION TRACKING SYSTEM
 # This cell must be executed first
 
 # Create execution tracker
@@ -55,15 +44,6 @@ def update_status(stage):
     print(f"✓ {stage.replace('_', ' ').title()} - Progress: {progress:.1f}%")
     
     return True
-
-# Check if we're running on Kaggle
-try:
-    import kaggle
-    IS_KAGGLE = True
-    print("✓ Detected Kaggle environment - Sequential execution mode active")
-except ImportError:
-    IS_KAGGLE = False
-    print("✓ Standard Jupyter environment detected")
 
 # Flag to begin execution
 print("Starting Phi-3 training pipeline...")
@@ -762,15 +742,6 @@ print("="*80)
 
 print("🤖 Initializing model with quantization...")
 
-# Check if required dependencies are available when running in Jupyter (non-sequential mode)
-if not IS_KAGGLE:
-    required_vars = ['tokenizer', 'tokenized_train', 'tokenized_val', 'LORA_R', 'LORA_ALPHA', 'LORA_DROPOUT']
-    missing_vars = [var for var in required_vars if var not in globals()]
-    if missing_vars:
-        print(f"⚠️ WARNING: Some required variables are not defined: {', '.join(missing_vars)}")
-        print("When running in Jupyter, make sure all previous data preparation cells were executed.")
-        print("Proceeding anyway as this might be running in sequential mode...")
-
 # Create a flag to track which quantization method we're using
 USING_AQLM = False
 QUANT_BITS = 2  # Default to 2-bit quantization
@@ -924,16 +895,6 @@ print("="*80)
 
 print("🔧 Creating trainer and configuring training parameters...")
 
-# Verify dependencies when running in Jupyter mode
-if not IS_KAGGLE:
-    required_vars = ['model', 'training_args', 'tokenized_train', 'tokenized_val', 
-                     'tokenizer', 'data_collator', 'early_stopping_callback']
-    missing_vars = [var for var in required_vars if var not in globals()]
-    if missing_vars:
-        print(f"⚠️ WARNING: Missing required variables: {', '.join(missing_vars)}")
-        print("When running in Jupyter, make sure to run all previous cells first.")
-        print("Proceeding anyway as this might be running in sequential mode...")
-
 # Create trainer for GPU/CPU
 print("Setting up trainer...")
     
@@ -1000,12 +961,6 @@ def monitor_resources():
     
     print("")  # Add blank line for readability
 
-# Verify trainer is initialized when running in Jupyter mode
-if not IS_KAGGLE and ('trainer' not in globals() or trainer is None):
-    print("⚠️ ERROR: Trainer not initialized. Please run the trainer setup cell first.")
-    if 'model' not in globals():
-        print("⚠️ ERROR: Model not initialized. Please run the model initialization cell first.")
-    raise RuntimeError("Required components not initialized. Please run previous cells first.")
 
 print("🚀 Starting training process...")
 print("This will take some time. Training progress will be displayed below.")
@@ -1191,15 +1146,6 @@ except Exception as e:
 print("\n" + "="*80)
 print("SECTION 6: MODEL TESTING")
 print("="*80)
-
-# Verify required components are available
-if not IS_KAGGLE:
-    required_test_vars = ['model', 'tokenizer', 'device', 'QUANT_BITS', 'quant_method']
-    missing_vars = [var for var in required_test_vars if var not in globals()]
-    if missing_vars:
-        print(f"⚠️ WARNING: Missing required variables: {', '.join(missing_vars)}")
-        print("When running in Jupyter, make sure you've completed the training process first.")
-        print("Proceeding anyway as this might be running in sequential mode...")
 
 try:
     print(f"🧪 Testing the {QUANT_BITS}-bit {quant_method} quantized model with Swift code examples...")
