@@ -21,15 +21,6 @@
 # Install required libraries
 !pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
 
-# Install PyTorch/XLA for TPU support
-try:
-    print("Installing PyTorch/XLA for TPU support...")
-    !pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
-    TPU_INSTALLATIONS_ATTEMPTED = True
-except Exception as e:
-    print(f"Note: PyTorch/XLA installation error: {e}. TPU support may not be available.")
-    TPU_INSTALLATIONS_ATTEMPTED = False
-
 # Set PyTorch memory management environment variables to avoid fragmentation
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -58,19 +49,6 @@ from transformers import (
 )
 from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-# Try to import PyTorch/XLA for TPU support
-TPU_AVAILABLE = False
-try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    TPU_AVAILABLE = True
-    print("✓ PyTorch/XLA successfully imported - TPU support is available")
-except ImportError:
-    print("PyTorch/XLA not available - TPU support will not be enabled")
-    TPU_AVAILABLE = False
 
 # Define memory cleanup function
 def cleanup_memory():
@@ -108,26 +86,8 @@ def monitor_resources():
 
 
 # %%
-# Check for available accelerators (TPU, GPU, or CPU) and configure accordingly
-if TPU_AVAILABLE:
-    # Set up for TPU training
-    device = xm.xla_device()
-    print(f"🚀 Using TPU: {xm.get_device_type()}")
-    print(f"TPU cores available: {xm.xrt_world_size()}")
-    
-    # Print TPU specific information
-    tpu_info = {}
-    try:
-        tpu_info['device'] = str(device)
-        tpu_info['xla_device_type'] = xm.get_device_type()
-        tpu_info['xla_world_size'] = xm.xrt_world_size()
-        print(f"TPU Details: {json.dumps(tpu_info, indent=2)}")
-    except Exception as e:
-        print(f"Error getting TPU details: {e}")
-    
-    # TPU memory management
-    print("Optimizing for TPU training...")
-elif torch.cuda.is_available():
+# Configure device (GPU or CPU)
+if torch.cuda.is_available():
     # Set up for distributed training on multiple GPUs
     device = torch.device('cuda')
     print(f"Using GPU: {torch.cuda.get_device_name(0)}")
@@ -646,66 +606,32 @@ try:
     # Create output directory if it doesn't exist
     os.makedirs("./phi3_swift_model", exist_ok=True)
     
-    # Configure training arguments based on the available hardware
-    if TPU_AVAILABLE:
-        print("Configuring training arguments for TPU...")
-        training_args = TrainingArguments(
-            output_dir="./phi3_swift_model",
-            num_train_epochs=NUM_EPOCHS,
-            per_device_train_batch_size=BATCH_SIZE,
-            per_device_eval_batch_size=BATCH_SIZE,
-            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-            learning_rate=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY,
-            warmup_ratio=WARMUP_RATIO,
-            logging_dir="./logs",
-            logging_steps=10,
-            save_steps=500,
-            save_total_limit=2,
-            eval_strategy="steps",
-            eval_steps=500,
-            load_best_model_at_end=True,
-            bf16=True,  # Use bfloat16 for TPU
-            fp16=False,  # Disable fp16 when using TPU with bf16
-            gradient_checkpointing=True,
-            # TPU specific settings
-            dataloader_num_workers=2,
-            dataloader_pin_memory=False,
-            report_to="none",
-            # Disable features not compatible with TPU
-            ddp_find_unused_parameters=None,
-            local_rank=-1,
-            tpu_num_cores=xm.xrt_world_size() if TPU_AVAILABLE else None,
-        )
-        print(f"Training arguments configured for TPU with {xm.xrt_world_size()} cores")
-        print(f"Using bfloat16 precision: {training_args.bf16}")
-    else:
-        # Configure training arguments with distributed training settings for GPU/CPU
-        training_args = TrainingArguments(
-            output_dir="./phi3_swift_model",
-            num_train_epochs=NUM_EPOCHS,
-            per_device_train_batch_size=BATCH_SIZE,
-            per_device_eval_batch_size=BATCH_SIZE,
-            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-            learning_rate=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY,
-            warmup_ratio=WARMUP_RATIO,
-            logging_dir="./logs",
-            logging_steps=10,
-            save_steps=500,
-            save_total_limit=2,
-            eval_strategy="steps",
-            eval_steps=500,
-            load_best_model_at_end=True,
-            fp16=True,  # Use mixed precision training
-            gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
-            # Distributed training parameters
-            local_rank=int(os.environ.get("LOCAL_RANK", -1)),  # For distributed training
-            ddp_find_unused_parameters=False,  # Optimize DDP
-            dataloader_num_workers=2,  # Reduced from 4 to save memory
-            dataloader_pin_memory=False,  # Disable pin memory to reduce memory usage
-            report_to="none"  # Disable reporting to avoid extra overhead
-        )
+    # Configure training arguments with distributed training settings for GPU/CPU
+    training_args = TrainingArguments(
+        output_dir="./phi3_swift_model",
+        num_train_epochs=NUM_EPOCHS,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        warmup_ratio=WARMUP_RATIO,
+        logging_dir="./logs",
+        logging_steps=10,
+        save_steps=500,
+        save_total_limit=2,
+        eval_strategy="steps",
+        eval_steps=500,
+        load_best_model_at_end=True,
+        fp16=True,  # Use mixed precision training
+        gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
+        # Distributed training parameters
+        local_rank=int(os.environ.get("LOCAL_RANK", -1)),  # For distributed training
+        ddp_find_unused_parameters=False,  # Optimize DDP
+        dataloader_num_workers=2,  # Reduced from 4 to save memory
+        dataloader_pin_memory=False,  # Disable pin memory to reduce memory usage
+        report_to="none"  # Disable reporting to avoid extra overhead
+    )
     
     print(f"Training arguments configured for {'multi-GPU' if torch.cuda.device_count() > 1 else 'single-GPU'} training")
     print(f"Using gradient checkpointing: {training_args.gradient_checkpointing}")
@@ -723,7 +649,7 @@ early_stopping_callback = EarlyStoppingCallback(
     early_stopping_threshold=0.01
 )
 
-# Load and prepare the model based on the available hardware
+# Load and prepare the model
 try:
     print(f"Loading {MODEL_NAME} with 4-bit quantization...")
     
@@ -735,38 +661,23 @@ try:
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,  # Use nested quantization for more memory efficiency
         bnb_4bit_quant_type="nf4",        # Normalized float 4 for better accuracy
-        bnb_4bit_compute_dtype=torch.float16 if not TPU_AVAILABLE else torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16,
         llm_int8_has_fp16_weight=False,   # Reduce memory footprint
         llm_int8_threshold=6.0,
         llm_int8_skip_modules=None,
     )
     
-    if TPU_AVAILABLE:
-        print("Loading model for TPU with 4-bit quantization...")
-        # For TPUs, we need to avoid device_map="auto" and move to TPU device after loading
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,  # bfloat16 is preferred for TPUs
-            trust_remote_code=True,
-            use_cache=False,  # Disable KV cache during training for better memory efficiency
-            low_cpu_mem_usage=True
-        )
-        # Move model to TPU manually after loading
-        model.to(device)
-        print("Model successfully moved to TPU device")
-    else:
-        # Load model with proper device mapping for multi-GPU distribution
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            quantization_config=bnb_config,
-            device_map="auto" if torch.cuda.is_available() else None,  # Automatically distribute across available GPUs
-            offload_folder="offload",  # Enable CPU offloading if needed
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            use_cache=False,  # Disable KV cache during training for better memory efficiency
-            low_cpu_mem_usage=True
-        )
+    # Load model with proper device mapping for multi-GPU distribution
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto" if torch.cuda.is_available() else None,  # Automatically distribute across available GPUs
+        offload_folder="offload",  # Enable CPU offloading if needed
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+        use_cache=False,  # Disable KV cache during training for better memory efficiency
+        low_cpu_mem_usage=True
+    )
     
     print(f"Successfully loaded model with 4-bit quantization")
     
@@ -832,47 +743,21 @@ data_collator = CustomDataCollatorForLanguageModeling(
 )
 
 # %%
-# Create trainer with the appropriate setup based on hardware
-if TPU_AVAILABLE:
-    # For TPU, we need special setup with XLA integration
-    print("Setting up trainer with TPU optimizations...")
-    
-    # Create a TPU-optimized trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_val,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        callbacks=[early_stopping_callback]
-    )
-    
-    # Add TPU-specific verification print
-    print("TPU Trainer successfully initialized")
-    print(f"Using TPU device: {device}")
-    print(f"TPU cores being used: {xm.xrt_world_size()}")
-    
-    # Verify model is on TPU
-    model_device = next(model.parameters()).device
-    print(f"Model is on device: {model_device}")
-    print(f"Is model on TPU: {'xla' in str(model_device).lower()}")
-else:
-    # Standard trainer for GPU/CPU
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_val,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        callbacks=[early_stopping_callback]
-    )
-    
-    # Verify model device
-    model_device = next(model.parameters()).device
-    device_type = "GPU" if torch.cuda.is_available() else "CPU"
-    print(f"Model is on {device_type} device: {model_device}")
+# Create trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_val,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    callbacks=[early_stopping_callback]
+)
+
+# Verify model device
+model_device = next(model.parameters()).device
+device_type = "GPU" if torch.cuda.is_available() else "CPU"
+print(f"Model is on {device_type} device: {model_device}")
 
 print("Training setup complete")
 
@@ -890,21 +775,8 @@ def monitor_resources():
     print(f"Process Memory: {memory_info.rss / 1024 / 1024:.2f} MB")
     print(f"System Memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available")
     
-    # Check which device we're using and show appropriate memory metrics
-    if TPU_AVAILABLE:
-        print("\nTPU Resources:")
-        try:
-            # Try to get TPU memory info if available
-            if hasattr(xm, 'get_memory_info'):
-                mem_info = xm.get_memory_info(device)
-                print(f"TPU Memory - Free: {mem_info['kb_free']/1024:.2f} MB, Total: {mem_info['kb_total']/1024:.2f} MB")
-            print(f"TPU Device: {xm.get_device_type()}")
-            print(f"TPU Cores: {xm.xrt_world_size()}")
-        except Exception as e:
-            print(f"Error getting TPU memory information: {e}")
-    
     # Add detailed GPU memory tracking
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         print(f"\nGPU Memory Usage ({num_gpus} GPUs detected):")
         
