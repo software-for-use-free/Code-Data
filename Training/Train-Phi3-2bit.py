@@ -330,6 +330,9 @@ NUM_EPOCHS = 3
 WARMUP_RATIO = 0.03
 GRADIENT_ACCUMULATION_STEPS = 8  # Increased gradient accumulation to compensate for smaller batch size
 
+# Output configuration
+OUTPUT_DIR = "./phi3_swift_model"  # Single output directory for all model artifacts
+
 # LoRA configuration
 LORA_R = 8  # Reduced from 16 to save memory
 LORA_ALPHA = 16  # Reduced from 32 to save memory
@@ -826,11 +829,11 @@ except Exception as e:
 # Set up training arguments with optimized settings for multi-GPU training
 try:
     # Create output directory if it doesn't exist
-    os.makedirs("./phi3_swift_model", exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     # Configure training arguments with enhanced memory optimizations for multi-GPU training
     training_args = TrainingArguments(
-        output_dir="./phi3_swift_model",
+        output_dir=OUTPUT_DIR,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
@@ -915,7 +918,7 @@ print("="*80)
 print("🤖 Initializing model with quantization...")
 
 # Create a flag to track which quantization method we're using
-USING_AQLM = False
+USING_GGUF = False
 QUANT_BITS = 2  # Default to 2-bit quantization
 
 print(f"📥 Loading {MODEL_NAME} with {QUANT_BITS}-bit quantization...")
@@ -1141,7 +1144,7 @@ except Exception as e:
     # Fallback to using BitsAndBytes for 4-bit quantization
     print(f"Falling back to BitsAndBytes 4-bit quantization: {e}")
     QUANT_BITS = 4
-    USING_AQLM = False
+    USING_GGUF = False
     
     # BitsAndBytes 4-bit quantization with CPU offloading for training
     # Note: This requires the multi-backend version of BitsAndBytes we installed earlier
@@ -1445,7 +1448,7 @@ print(f"Model trainable parameters: {sum(p.numel() for p in model.parameters() i
 print(f"Model parameters using memory: {sum(p.numel() * (2 if p.dtype == torch.float16 else 4) for p in model.parameters()) / (1024**2):.2f} MB")
 
 # Print information about the quantized model
-quant_method = "AQLM" if USING_AQLM else "BitsAndBytes"
+quant_method = "GGUF" if USING_GGUF else "BitsAndBytes"
 print(f"✅ Model loaded and configured with {QUANT_BITS}-bit {quant_method} quantization and LoRA (rank={LORA_R})")
 print(f"Model architecture: {model.__class__.__name__}")
 print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
@@ -1690,15 +1693,15 @@ try:
     print("\n💾 Saving trained model...")
     
     # Save the model
-    trainer.save_model("./phi3_swift_model")
+    trainer.save_model(OUTPUT_DIR)
     
     # Determine the quantization method for display
-    quant_method = "AQLM" if USING_AQLM else "BitsAndBytes"
-    print(f"✅ Model saved to ./phi3_swift_model ({QUANT_BITS}-bit {quant_method} quantized)")
+    quant_method = "GGUF" if USING_GGUF else "BitsAndBytes"
+    print(f"✅ Model saved to {OUTPUT_DIR} ({QUANT_BITS}-bit {quant_method} quantized)")
     print(f"   Trained on: {'GPU' if torch.cuda.is_available() else 'CPU'}")
     
     # Save model configuration details
-    with open("./phi3_swift_model/quantization_config.json", "w") as f:
+    with open(f"{OUTPUT_DIR}/quantization_config.json", "w") as f:
         config_data = {
             "quantization_method": quant_method,
             "bits": QUANT_BITS,
@@ -1712,68 +1715,15 @@ try:
         json.dump(config_data, f, indent=2)
         print("✅ Model configuration saved")
     
-    # Create appropriate loading instructions based on quantization method
-    if USING_AQLM:
-        loading_code = """```python
-from aqlm import quantize
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# Load the tokenizer
-tokenizer = AutoTokenizer.from_pretrained("./phi3_swift_model")
-
-# Load the base model first (to apply quantization)
-base_model = AutoModelForCausalLM.from_pretrained("./phi3_swift_model")
-
-# Apply AQLM quantization
-model = quantize(base_model, bits=QUANT_BITS, lora_rank=LORA_R)
-```"""
-    else:
-        loading_code = """```python
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-import torch
-
-# Load the tokenizer
-tokenizer = AutoTokenizer.from_pretrained("./phi3_swift_model")
-
-# Configure 4-bit quantization
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True
-)
-
-# Load the quantized model
-model = AutoModelForCausalLM.from_pretrained(
-    "./phi3_swift_model",
-    quantization_config=bnb_config,
-    device_map="auto"
-)
-```"""
-        
-    # Also save a README with information about the quantization
-    print("📝 Creating model documentation...")
-    with open("./phi3_swift_model/README.md", "w") as f:
-        f.write(f"""# Phi-3-mini Quantized Model for Swift
-
-This model is a {QUANT_BITS}-bit quantized version of `{MODEL_NAME}` trained for Swift programming.
-
-## Quantization Details
-- Method: {quant_method}
-- Bits: {QUANT_BITS} 
-- Training dataset: {DATASET_ID}
-- Fine-tuning method: LoRA (Low-Rank Adaptation)
-- LoRA rank: {LORA_R}
-- LoRA alpha: {LORA_ALPHA}
-- Training date: {time.strftime("%Y-%m-%d")}
-
-## Usage
-
-To load this model:
-
-{loading_code}
-
-This quantized model reduces memory usage significantly while maintaining most of the capabilities of the original model.
+    # Skip creating loading instructions - we just want the model files
+    
+    # Add a minimal config file for reference
+    with open(f"{OUTPUT_DIR}/model_info.txt", "w") as f:
+        f.write(f"""MODEL INFO
+Model: {MODEL_NAME}
+Quantization: {quant_method} {QUANT_BITS}-bit
+Trained on: {DATASET_ID}
+Date: {time.strftime("%Y-%m-%d")}
 """)
         print("✅ Model documentation created")
     
