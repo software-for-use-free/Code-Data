@@ -21,10 +21,18 @@
 # Install required libraries
 !pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft bitsandbytes
 
-# Set PyTorch memory management environment variables to avoid fragmentation
+# Set PyTorch memory management environment variables to avoid fragmentation and OOM issues
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Configure CUDA memory allocation for better memory management
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Explicitly set to use 2 GPUs
+# Enable better memory handling with CPU offloading
+os.environ["ACCELERATE_USE_CPU_OFFLOAD"] = "1"
+os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
+# Enable disk offloading if needed
+os.environ["ACCELERATE_ENABLE_DISK_OFFLOAD"] = "1"
+# Enable training with CPU offloading
+os.environ["BNB_OFFLOAD_TRAINING"] = "1"  # Critical for training with CPU offload
 
 # %%
 # Import required libraries
@@ -50,14 +58,53 @@ from transformers import (
 from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# Define memory cleanup function
+# Define Kaggle-optimized memory cleanup function
 def cleanup_memory():
-    """Clean up GPU memory to avoid fragmentation."""
-    print("Cleaning up memory...")
-    gc.collect()
+    """
+    Clean up GPU memory with aggressive management optimized for training environments.
+    Handles GPU memory, system temp files, and Python memory with multiple strategies.
+    """
+    print("Cleaning up memory with optimized strategies...")
+    
+    # Clear Python's garbage collector multiple times
+    for _ in range(3):
+        gc.collect()
+    
+    # Force Python to release memory to OS if possible
+    if hasattr(gc, 'mem_free'):
+        gc.mem_free()  # Some Python installations support this
+    
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Empty CUDA cache with multiple strategies
+        torch.cuda.empty_cache()  # Standard cleanup
+        torch.cuda.synchronize()  # Wait for all CUDA operations to finish
+        
+        # Try to release all CUDA memory and reinitialize if necessary
+        for i in range(torch.cuda.device_count()):
+            # Force deallocate any unused memory
+            if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+                torch.cuda.reset_peak_memory_stats(i)
+            if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
+                try:
+                    torch.cuda.reset_accumulated_memory_stats(i)
+                except:
+                    pass
+            
+            # Print memory info after cleanup
+            if hasattr(torch.cuda, 'memory_allocated'):
+                alloc = torch.cuda.memory_allocated(i) / (1024**3)
+                reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                print(f"  GPU {i} after cleanup: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved")
+        
+        # Try to explicitly clear CUDA memory pools
+        try:
+            # This works on newer PyTorch versions
+            torch.cuda._cached_memory_pool.empty_cache()
+        except:
+            pass
+    
+    # Run gc again at the end
+    gc.collect()
         
 # Define resource monitoring function
 def monitor_resources():
@@ -623,18 +670,43 @@ try:
         eval_strategy="steps",
         eval_steps=500,
         load_best_model_at_end=True,
-        fp16=True,  # Use mixed precision training
+        
+        # Memory optimization settings
+        fp16=True,                    # Use mixed precision training
+        bf16=False,                   # Don't use bfloat16 (T4 GPUs don't support it)
         gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
+        
         # Distributed training parameters
         local_rank=int(os.environ.get("LOCAL_RANK", -1)),  # For distributed training
         ddp_find_unused_parameters=False,  # Optimize DDP
-        dataloader_num_workers=2,  # Reduced from 4 to save memory
+        ddp_bucket_cap_mb=50,         # Limit communication buffer size
+        
+        # Additional memory optimizations
+        optim="adamw_torch_fused",    # Use fused optimizer for better memory efficiency
+        dataloader_drop_last=True,    # Drop last batch if it's incomplete
+        dataloader_num_workers=1,     # Limit dataloader workers to save memory
+        group_by_length=True,         # Group similar length sequences to minimize padding
+        
+        # Reduce memory pressure during evaluation
+        eval_accumulation_steps=4,    # Accumulate gradients during evaluation
+        
+        # Avoid OOM during save operations
+        save_safetensors=True,        # Use safetensors format for saving
+        push_to_hub=False,            # Don't push to hub to save memory
         dataloader_pin_memory=False,  # Disable pin memory to reduce memory usage
         report_to="none"  # Disable reporting to avoid extra overhead
     )
     
     print(f"Training arguments configured for {'multi-GPU' if torch.cuda.device_count() > 1 else 'single-GPU'} training")
     print(f"Using gradient checkpointing: {training_args.gradient_checkpointing}")
+    
+    # Adjust DDP parameters based on model inspection
+    if torch.cuda.device_count() > 1:
+        print("Multi-GPU training detected, optimizing DDP parameters...")
+        # For Phi-3 models, we need to set find_unused_parameters=True
+        # This helps prevent DDP synchronization issues
+        training_args.ddp_find_unused_parameters = True
+        print("Set ddp_find_unused_parameters=True for multi-GPU training")
     print(f"Using mixed precision: {training_args.fp16}")
     print(f"Local rank: {training_args.local_rank}")
     
@@ -662,22 +734,111 @@ try:
         bnb_4bit_use_double_quant=True,  # Use nested quantization for more memory efficiency
         bnb_4bit_quant_type="nf4",        # Normalized float 4 for better accuracy
         bnb_4bit_compute_dtype=torch.float16,
-        llm_int8_has_fp16_weight=False,   # Reduce memory footprint
-        llm_int8_threshold=6.0,
-        llm_int8_skip_modules=None,
+        # Add CPU offloading settings for training
+        bnb_4bit_compute_dtype_for_cpu_offload=torch.float32,
+        # Additional settings to help with CPU offloaded training
+        llm_int8_enable_fp32_cpu_offload=True,  # Critical for CPU offloading during training
+        llm_int8_has_fp16_weight=True,  # Help with mixed precision during offloading
+        llm_int8_threshold=6.0,  # Adjust threshold for better quantization quality
     )
     
-    # Load model with proper device mapping for multi-GPU distribution
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        quantization_config=bnb_config,
-        device_map="auto" if torch.cuda.is_available() else None,  # Automatically distribute across available GPUs
-        offload_folder="offload",  # Enable CPU offloading if needed
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-        use_cache=False,  # Disable KV cache during training for better memory efficiency
-        low_cpu_mem_usage=True
-    )
+    # Create offload folder for disk offloading
+    offload_folder = "./offload"
+    os.makedirs(offload_folder, exist_ok=True)
+    print(f"Using offload folder: {offload_folder}")
+    
+    # Determine the number of layers in the model
+    # For Phi-3-mini, we know it has 32 layers
+    if "phi-3" in MODEL_NAME.lower() or "phi3" in MODEL_NAME.lower():
+        if "mini" in MODEL_NAME.lower():
+            n_layers = 32  # Phi-3-mini has 32 layers
+        elif "medium" in MODEL_NAME.lower():
+            n_layers = 60  # Phi-3-medium has 60 layers
+        elif "small" in MODEL_NAME.lower():
+            n_layers = 26  # Phi-3-small has 26 layers
+        else:
+            n_layers = 32  # Default for unknown Phi-3 variant
+    else:
+        n_layers = 32  # Default fallback
+    
+    print(f"Model has {n_layers} layers")
+    
+    # Configure custom device map for better layer distribution
+    # Split layers across GPUs and CPU optimally
+    gpu0_layers = n_layers // 3      # ~33% on GPU 0
+    gpu1_layers = n_layers // 3      # ~33% on GPU 1
+    cpu_layers = n_layers - gpu0_layers - gpu1_layers  # ~34% on CPU with offloading
+    
+    print(f"Using hybrid configuration: {gpu0_layers} layers on GPU 0, {gpu1_layers} layers on GPU 1, {cpu_layers} layers on CPU")
+    
+    # Create custom device map
+    device_map = {
+        "model.embed_tokens": 0,  # Keep embeddings on GPU 0
+        "model.norm": 0,          # Keep normalization on GPU 0
+        "lm_head": 0,             # Keep LM head on GPU 0
+    }
+    
+    # Assign layers to devices
+    for i in range(n_layers):
+        layer_device = None
+        if i < gpu0_layers:
+            layer_device = 0
+        elif i < gpu0_layers + gpu1_layers:
+            layer_device = 1
+        else:
+            layer_device = "cpu"
+        
+        # Add all possible layer naming patterns to device map
+        device_map[f"model.layers.{i}"] = layer_device
+        # Additional patterns for Phi models
+        device_map[f"transformer.h.{i}"] = layer_device
+        device_map[f"model.decoder.layers.{i}"] = layer_device
+        device_map[f"model.transformer.h.{i}"] = layer_device
+        device_map[f"phi_model.layers.{i}"] = layer_device
+        device_map[f"layers.{i}"] = layer_device
+    
+    # Set explicit memory limits
+    max_memory = {
+        0: "9GB",          # Reserve headroom on GPU 0
+        1: "9GB",          # Reserve headroom on GPU 1
+        "cpu": "24GB",     # Limit CPU memory usage
+    }
+    
+    # Load model with custom device mapping
+    try:
+        print("Loading model with custom device mapping...")
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            max_memory=max_memory,
+            offload_folder=offload_folder,
+            offload_state_dict=True,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            use_cache=False,  # Disable KV cache during training for better memory efficiency
+            low_cpu_mem_usage=True
+        )
+        print("Successfully loaded model with custom device mapping")
+    except Exception as e:
+        print(f"Error loading with custom device map: {e}")
+        print("Falling back to automatic device map...")
+        
+        # Perform deep cleanup
+        cleanup_memory()
+        
+        # Fallback to automatic device mapping
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map="auto",
+            max_memory=max_memory,
+            offload_folder=offload_folder,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            use_cache=False,
+            low_cpu_mem_usage=True
+        )
     
     print(f"Successfully loaded model with 4-bit quantization")
     
@@ -690,7 +851,9 @@ try:
         lora_dropout=LORA_DROPOUT,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        # Target only essential modules to save memory
+        target_modules=["q_proj", "v_proj", "o_proj", "gate_proj"],
+        modules_to_save=None,  # Don't save any modules fully to save memory
     )
     
     # Prepare the model for training - crucial for memory efficiency
@@ -741,6 +904,17 @@ data_collator = CustomDataCollatorForLanguageModeling(
 
 # %%
 # Create trainer
+# Create a custom callback to monitor memory usage during training
+from transformers.trainer_callback import TrainerCallback
+
+class MemoryMonitorCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % 100 == 0:  # Check every 100 steps
+            monitor_resources()
+            # Force cleanup to prevent memory buildup
+            cleanup_memory()
+        return control
+
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -748,7 +922,7 @@ trainer = Trainer(
     eval_dataset=tokenized_val,
     tokenizer=tokenizer,
     data_collator=data_collator,
-    callbacks=[early_stopping_callback]
+    callbacks=[early_stopping_callback, MemoryMonitorCallback()]
 )
 
 # Verify model device
@@ -926,7 +1100,7 @@ try:
                 eval_dataset=tokenized_val,
                 tokenizer=tokenizer,
                 data_collator=data_collator,
-                callbacks=[early_stopping_callback, OOMGuardCallback()]
+                callbacks=[early_stopping_callback, OOMGuardCallback(), MemoryMonitorCallback()]
             )
             
             # Try again with new settings
