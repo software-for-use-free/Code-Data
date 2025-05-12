@@ -996,7 +996,8 @@ try:
                 top_p=0.9,
                 do_sample=True,
                 pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=False  # Disable KV cache to avoid DynamicCache error
             )
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         # Extract just the assistant's response
