@@ -380,6 +380,9 @@ NUM_EPOCHS = 3
 WARMUP_RATIO = 0.03
 GRADIENT_ACCUMULATION_STEPS = 8  # Increased gradient accumulation to compensate for smaller batch size
 
+# Output configuration
+OUTPUT_DIR = "./phi3_swift_model"  # Single output directory for all model artifacts
+
 # LoRA configuration
 LORA_R = 8  # Reduced from 16 to save memory
 LORA_ALPHA = 16  # Reduced from 32 to save memory
@@ -876,11 +879,11 @@ except Exception as e:
 # Set up training arguments with optimized settings for multi-GPU training
 try:
     # Create output directory if it doesn't exist
-    os.makedirs("./phi3_swift_model", exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     # Configure training arguments with enhanced memory optimizations for multi-GPU training
     training_args = TrainingArguments(
-        output_dir="./phi3_swift_model",
+        output_dir=OUTPUT_DIR,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
@@ -1670,17 +1673,17 @@ try:
     print("\n💾 Saving trained model...")
     
     # Save the model
-    trainer.save_model("./phi3_swift_model")
+    trainer.save_model(OUTPUT_DIR)
     
     # Determine the quantization method for display
     quant_method = "GGUF" if USING_GGUF else "BitsAndBytes"
-    print(f"✅ Model saved to ./phi3_swift_model ({QUANT_BITS}-bit {quant_method} quantized)")
+    print(f"✅ Model saved to {OUTPUT_DIR} ({QUANT_BITS}-bit {quant_method} quantized)")
     if USING_GGUF:
-        print(f"✅ GGUF model also saved to ./phi3_swift_model_gguf/model.gguf")
+        print(f"✅ GGUF model also saved to {OUTPUT_DIR}/model.gguf")
     print(f"   Trained on: {'GPU' if torch.cuda.is_available() else 'CPU'}")
     
     # Save model configuration details
-    with open("./phi3_swift_model/quantization_config.json", "w") as f:
+    with open(f"{OUTPUT_DIR}/quantization_config.json", "w") as f:
         config_data = {
             "quantization_method": quant_method,
             "bits": QUANT_BITS,
@@ -1694,134 +1697,17 @@ try:
         json.dump(config_data, f, indent=2)
         print("✅ Model configuration saved")
     
-    # Create appropriate loading instructions based on quantization method
-    if USING_GGUF:
-        loading_code = """```python
-# Method 1: Using ctransformers (recommended for simplicity)
-from ctransformers import AutoModelForCausalLM
-
-# Load the GGUF quantized model
-model = AutoModelForCausalLM.from_pretrained(
-    "./phi3_swift_model_gguf/model.gguf",
-    model_type="phi",
-    gpu_layers=24,  # Adjust based on your GPU memory
-    context_length=4096  # Adjust based on your needs
-)
-
-# Alternative Method 2: Using llama-cpp-python for more options
-from llama_cpp import Llama
-
-model = Llama(
-    model_path="./phi3_swift_model_gguf/model.gguf",
-    n_gpu_layers=24,  # Adjust based on your GPU memory
-    n_ctx=4096        # Adjust based on your needs
-)
-```"""
-    else:
-        loading_code = """```python
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-import torch
-
-# Load the tokenizer
-tokenizer = AutoTokenizer.from_pretrained("./phi3_swift_model")
-
-# Configure 4-bit quantization
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True
-)
-
-# Load the quantized model
-model = AutoModelForCausalLM.from_pretrained(
-    "./phi3_swift_model",
-    quantization_config=bnb_config,
-    device_map="auto"
-)
-```"""
-        
-    # Also save a README with information about the quantization
-    print("📝 Creating model documentation...")
-    with open("./phi3_swift_model/README.md", "w") as f:
-        f.write(f"""# Phi-3-mini Quantized Model for Swift
-
-This model is a {QUANT_BITS}-bit quantized version of `{MODEL_NAME}` trained for Swift programming.
-
-## Quantization Details
-- Method: {quant_method}
-- Bits: {QUANT_BITS} 
-- Training dataset: {DATASET_ID}
-- Fine-tuning method: LoRA (Low-Rank Adaptation)
-- LoRA rank: {LORA_R}
-- LoRA alpha: {LORA_ALPHA}
-- Training date: {time.strftime("%Y-%m-%d")}
-
-## Usage
-
-To load this model:
-
-{loading_code}
-
-This quantized model reduces memory usage significantly while maintaining most of the capabilities of the original model.
-""")
+    # Skip creating loading instructions - we just want the model files
     
-    # If using GGUF, create a separate README for the GGUF model
-    if USING_GGUF:
-        with open("./phi3_swift_model_gguf/README.md", "w") as f:
-            f.write(f"""# Phi-3-mini GGUF Quantized Model for Swift
-
-This is a {QUANT_BITS}-bit GGUF quantized version of `{MODEL_NAME}` for Swift programming.
-
-## Quantization Details
-- Method: GGUF (General GPU Usable Format)
-- Quantization Type: {quant_type if 'quant_type' in locals() else f'q{QUANT_BITS}_k'}
-- Bits: {QUANT_BITS}
-- Base Model: `{MODEL_NAME}`
-- Training Dataset: {DATASET_ID}
-- Created: {time.strftime("%Y-%m-%d")}
-
-## Usage
-
-### Method 1: Using ctransformers
-```python
-from ctransformers import AutoModelForCausalLM
-
-model = AutoModelForCausalLM.from_pretrained(
-    "./model.gguf",
-    model_type="phi",
-    gpu_layers=24,  # Adjust based on your GPU memory
-    context_length=4096  # Adjust based on your needs
-)
-
-# Generate text
-response = model("Swift is a programming language that")
-print(response)
-```
-
-### Method 2: Using llama-cpp-python
-```python
-from llama_cpp import Llama
-
-model = Llama(
-    model_path="./model.gguf",
-    n_gpu_layers=24,  # Adjust based on your GPU memory
-    n_ctx=4096        # Adjust based on your needs
-)
-
-# Generate text
-response = model.create_completion(
-    "Swift is a programming language that",
-    max_tokens=128,
-    temperature=0.7,
-    top_p=0.95
-)
-print(response)
-```
-
-This GGUF quantized model allows efficient inference on various hardware while maintaining good quality.
+    # Add a minimal config file for reference
+    with open(f"{OUTPUT_DIR}/model_info.txt", "w") as f:
+        f.write(f"""MODEL INFO
+Model: {MODEL_NAME}
+Quantization: {quant_method} {QUANT_BITS}-bit
+Trained on: {DATASET_ID}
+Date: {time.strftime("%Y-%m-%d")}
 """)
-        print("✅ Model documentation created")
+        print("✅ Model info saved")
     
     # Update execution status
     if 'update_status' in globals():
