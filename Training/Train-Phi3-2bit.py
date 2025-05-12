@@ -109,23 +109,37 @@ except Exception as e:
     print(f"Error importing AQLM: {e}")
     print("Will fallback to 4-bit quantization using BitsAndBytes")
 
-# Define enhanced memory cleanup function
+# Define Kaggle-optimized memory cleanup function
 def cleanup_memory():
-    """Clean up GPU memory to avoid fragmentation with aggressive memory management."""
-    print("Cleaning up memory with enhanced strategies...")
-    # Clear Python's garbage collector
-    gc.collect()
+    """
+    Clean up GPU memory with aggressive management optimized for Kaggle environments.
+    Handles GPU memory, system temp files, and Python memory with multiple strategies.
+    """
+    print("Cleaning up memory with Kaggle-optimized strategies...")
+    
+    # Clear Python's garbage collector multiple times
+    for _ in range(3):
+        gc.collect()
+    
+    # Force Python to release memory to OS if possible
+    if hasattr(gc, 'mem_free'):
+        gc.mem_free()  # Some Python installations support this
     
     if torch.cuda.is_available():
-        # Empty CUDA cache
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Empty CUDA cache with multiple strategies
+        torch.cuda.empty_cache()  # Standard cleanup
+        torch.cuda.synchronize()  # Wait for all CUDA operations to finish
         
-        # Additional GPU memory cleanup steps
+        # Try to release all CUDA memory and reinitialize if necessary
         for i in range(torch.cuda.device_count()):
             # Force deallocate any unused memory
             if hasattr(torch.cuda, 'reset_peak_memory_stats'):
                 torch.cuda.reset_peak_memory_stats(i)
+            if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
+                try:
+                    torch.cuda.reset_accumulated_memory_stats(i)
+                except:
+                    pass
             
             # Print memory info after cleanup
             if hasattr(torch.cuda, 'memory_allocated'):
@@ -133,14 +147,94 @@ def cleanup_memory():
                 reserved = torch.cuda.memory_reserved(i) / (1024**3)
                 print(f"  GPU {i} after cleanup: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved")
         
-    # Explicitly delete any large objects that might be in memory
-    large_objects = [var for var in globals() if isinstance(globals()[var], (torch.Tensor, dict, list)) and sys.getsizeof(globals()[var]) > 1e6]
-    for obj in large_objects:
-        print(f"  Deleting large object: {obj}")
-        del globals()[obj]
+        # Try to explicitly clear CUDA memory pools
+        try:
+            # This works on newer PyTorch versions
+            torch.cuda._cached_memory_pool.empty_cache()
+        except:
+            pass
     
-    # Run gc again
+    # Explicitly delete any large objects that might be in memory
+    # First identify all large objects
+    large_objects = []
+    
+    # Look for larger threshold on tensors and arrays which are more common in ML
+    for var_name in list(globals().keys()):
+        var = globals()[var_name]
+        try:
+            # Calculate size more accurately for common ML objects
+            if isinstance(var, torch.Tensor):
+                size = var.element_size() * var.nelement()
+                if size > 1e6:  # 1MB
+                    large_objects.append(var_name)
+            elif isinstance(var, (list, dict, set)):
+                size = sys.getsizeof(var)
+                if size > 5e6:  # 5MB
+                    large_objects.append(var_name)
+            # Look for numpy arrays too
+            elif 'numpy' in str(type(var)):
+                try:
+                    size = var.nbytes
+                    if size > 1e6:
+                        large_objects.append(var_name)
+                except:
+                    pass
+        except:
+            continue
+    
+    # Delete identified large objects
+    for obj in large_objects:
+        if obj in globals():
+            print(f"  Deleting large object: {obj}")
+            try:
+                del globals()[obj]
+            except:
+                pass
+    
+    # Clean Kaggle temp directories if they exist
+    try:
+        # Common Kaggle temp directories that might accumulate files
+        kaggle_temp_dirs = [
+            "/tmp/transformers_cache",
+            "/tmp/torch_cache",
+            "/tmp/huggingface",
+            "/kaggle/working/tmp",
+            "/kaggle/temp"
+        ]
+        
+        import os
+        import shutil
+        
+        for temp_dir in kaggle_temp_dirs:
+            if os.path.exists(temp_dir) and os.path.isdir(temp_dir):
+                print(f"Cleaning Kaggle temp directory: {temp_dir}")
+                try:
+                    # Delete files older than 1 hour
+                    for root, dirs, files in os.walk(temp_dir):
+                        for f in files:
+                            try:
+                                full_path = os.path.join(root, f)
+                                # Only delete if older than 1 hour and not a necessary file
+                                if os.path.getmtime(full_path) < time.time() - 3600:
+                                    os.remove(full_path)
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"Error cleaning temp dir {temp_dir}: {e}")
+    except Exception as e:
+        print(f"Error during Kaggle temp cleanup: {e}")
+    
+    # Run gc again at the end
     gc.collect()
+    
+    # Try to force system to release memory to OS
+    try:
+        # Some systems support this call to release memory to the OS
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except:
+        pass
         
 # Define resource monitoring function
 def monitor_resources():
@@ -841,17 +935,54 @@ try:
             # Distribute layers across devices with CPU/disk offloading
             # Get number of layers with compatibility for different model types
             n_layers = None
-            # Try different attribute names used by various model architectures
-            for attr_name in ["num_hidden_layers", "n_layer", "num_layers", "n_blocks"]:
-                if hasattr(config, attr_name):
-                    n_layers = getattr(config, attr_name)
-                    print(f"Found layers count using config.{attr_name}: {n_layers}")
-                    break
+            
+            # First, try direct model name detection which is most reliable for Phi-3 models
+            if "phi-3" in MODEL_NAME.lower() or "phi3" in MODEL_NAME.lower():
+                # Use hardcoded values for known Phi-3 variants
+                if "mini" in MODEL_NAME.lower():
+                    n_layers = 32  # Phi-3-mini has 32 layers
+                    print(f"Direct model name detection: Phi-3-mini has {n_layers} layers")
+                elif "medium" in MODEL_NAME.lower():
+                    n_layers = 60  # Phi-3-medium has 60 layers
+                    print(f"Direct model name detection: Phi-3-medium has {n_layers} layers")
+                elif "small" in MODEL_NAME.lower():
+                    n_layers = 26  # Phi-3-small has 26 layers
+                    print(f"Direct model name detection: Phi-3-small has {n_layers} layers") 
+                else:
+                    n_layers = 32
+                    print(f"Direct model name detection: Unknown Phi-3 variant, assuming {n_layers} layers")
+            
+            # If we couldn't determine layers by name, try config attributes
+            if n_layers is None:
+                # Try different attribute names used by various model architectures
+                for attr_name in ["num_hidden_layers", "n_layer", "num_layers", "n_blocks"]:
+                    if hasattr(config, attr_name):
+                        n_layers = getattr(config, attr_name)
+                        print(f"Found layers count using config.{attr_name}: {n_layers}")
+                        break
             
             # As fallback for Phi-3 models, try to detect layers by architecture patterns
             if n_layers is None:
-                # For Phi-3 models specifically
-                if hasattr(config, "model_type") and "phi" in config.model_type.lower():
+                # For Phi-3 models - always use known architecture values rather than relying on config detection
+                # This is specifically needed for Microsoft's Phi-3 models
+                if "phi-3" in MODEL_NAME.lower() or "phi3" in MODEL_NAME.lower():
+                    # Force use model name detection since config detection fails
+                    print("Detected Microsoft Phi-3 model from name, using architecture-specific layer count")
+                    if "mini" in MODEL_NAME.lower():
+                        n_layers = 32  # Phi-3-mini has 32 layers
+                        print(f"Phi-3-mini detected, setting layers to: {n_layers}")
+                    elif "medium" in MODEL_NAME.lower():
+                        n_layers = 60  # Phi-3-medium has 60 layers
+                        print(f"Phi-3-medium detected, setting layers to: {n_layers}")
+                    elif "small" in MODEL_NAME.lower():
+                        n_layers = 26  # Phi-3-small has 26 layers
+                        print(f"Phi-3-small detected, setting layers to: {n_layers}")
+                    else:
+                        # Default to 32 for unknown Phi-3 variants
+                        n_layers = 32
+                        print(f"Unknown Phi-3 variant, defaulting to {n_layers} layers")
+                # Check model_type as well for redundancy
+                elif hasattr(config, "model_type") and ("phi" in config.model_type.lower()):
                     # Phi-3 typically has 32 layers in the mini version
                     if "mini" in MODEL_NAME.lower():
                         n_layers = 32
@@ -864,11 +995,17 @@ try:
                     else:
                         # Default to 32 for unknown Phi-3 variants
                         n_layers = 32
-                    print(f"Using estimated layers for Phi-3 model: {n_layers}")
+                    print(f"Using estimated layers for Phi-3 model from config.model_type: {n_layers}")
                 else:
-                    # Last resort default
-                    n_layers = 24
-                    print(f"Warning: Could not determine number of layers, using default: {n_layers}")
+                    # Explicitly check for common model names
+                    if "phi" in MODEL_NAME.lower():
+                        # This is likely a Phi model but we couldn't detect the variant
+                        n_layers = 32
+                        print(f"Detected a Phi model by name, using default of {n_layers} layers")
+                    else:
+                        # Last resort default
+                        n_layers = 32  # Changed from 24 to 32 as safer default
+                        print(f"Warning: Could not determine number of layers, using safer default: {n_layers}")
             
             gpu0_layers = n_layers // 4      # 25% on GPU 0
             gpu1_layers = n_layers // 4      # 25% on GPU 1
@@ -1020,12 +1157,31 @@ except Exception as e:
         # Distribute layers across devices with CPU/disk offloading
         # Get number of layers with compatibility for different model types
         n_layers = None
-        # Try different attribute names used by various model architectures
-        for attr_name in ["num_hidden_layers", "n_layer", "num_layers", "n_blocks"]:
-            if hasattr(config, attr_name):
-                n_layers = getattr(config, attr_name)
-                print(f"Found layers count using config.{attr_name}: {n_layers}")
-                break
+        
+        # First, try direct model name detection which is most reliable for Phi-3 models
+        if "phi-3" in MODEL_NAME.lower() or "phi3" in MODEL_NAME.lower():
+            # Use hardcoded values for known Phi-3 variants
+            if "mini" in MODEL_NAME.lower():
+                n_layers = 32  # Phi-3-mini has 32 layers
+                print(f"Direct model name detection: Phi-3-mini has {n_layers} layers")
+            elif "medium" in MODEL_NAME.lower():
+                n_layers = 60  # Phi-3-medium has 60 layers
+                print(f"Direct model name detection: Phi-3-medium has {n_layers} layers")
+            elif "small" in MODEL_NAME.lower():
+                n_layers = 26  # Phi-3-small has 26 layers
+                print(f"Direct model name detection: Phi-3-small has {n_layers} layers") 
+            else:
+                n_layers = 32
+                print(f"Direct model name detection: Unknown Phi-3 variant, assuming {n_layers} layers")
+        
+        # If we couldn't determine layers by name, try config attributes
+        if n_layers is None:
+            # Try different attribute names used by various model architectures
+            for attr_name in ["num_hidden_layers", "n_layer", "num_layers", "n_blocks"]:
+                if hasattr(config, attr_name):
+                    n_layers = getattr(config, attr_name)
+                    print(f"Found layers count using config.{attr_name}: {n_layers}")
+                    break
         
         # As fallback for Phi-3 models, try to detect layers by architecture patterns
         if n_layers is None:
@@ -1090,11 +1246,22 @@ except Exception as e:
             
             # Add all possible layer naming patterns to device map to ensure we catch the right one
             if hasattr(config, "model_type") and "phi" in config.model_type.lower():
-                # Add all possible patterns for Phi models
+                # Add all possible patterns for Phi models - optimized for Phi-3
+                # Primary pattern for Phi-3
                 device_map[f"model.layers.{i}"] = layer_device
+                
+                # Additional patterns with Phi-3-specific paths
                 device_map[f"transformer.h.{i}"] = layer_device
                 device_map[f"model.decoder.layers.{i}"] = layer_device
                 device_map[f"model.transformer.h.{i}"] = layer_device
+                
+                # Phi-3-specific naming patterns based on model inspection
+                device_map[f"phi_model.layers.{i}"] = layer_device
+                device_map[f"layers.{i}"] = layer_device
+                
+                # For absolute reliability, add all possible nested paths where Phi-3 layers could be
+                device_map[f"base_model.model.layers.{i}"] = layer_device
+                device_map[f"model.model.layers.{i}"] = layer_device
             else:
                 # Standard pattern for other models
                 device_map[f"{layer_prefix}.{i}"] = layer_device
@@ -1103,33 +1270,72 @@ except Exception as e:
         
         # Load with offloading and quantization - with error handling and fallbacks
         try:
-            print("Attempting to load model with custom device map...")
+            print("Attempting to load model with custom device map and CPU offloading...")
+            
+            # Create a modified version of BnB config that enables CPU offloading
+            # This is required when using quantization with CPU offloading 
+            cpu_offload_bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                llm_int8_enable_fp32_cpu_offload=True,  # Enable CPU offloading with quantized models
+                llm_int8_threshold=6.0,  # Increase threshold for more efficient offloading
+            )
+            
+            # Kaggle-optimized max memory allocation - be more conservative
+            max_memory = {
+                0: "9GB",          # Reserve more headroom on GPU 0
+                1: "9GB",          # Reserve more headroom on GPU 1
+                "cpu": "24GB",     # Limit CPU memory usage for Kaggle
+            }
+            
             model = AutoModelForCausalLM.from_pretrained(
                 MODEL_NAME,
-                quantization_config=bnb_config,
+                quantization_config=cpu_offload_bnb_config,  # Use modified config with CPU offloading enabled
                 device_map=device_map,
                 offload_folder=offload_folder,
                 offload_state_dict=True,
+                max_memory=max_memory,  # Add explicit memory limits
+                low_cpu_mem_usage=True,  # Enable more aggressive CPU memory optimization
                 torch_dtype=torch.float16,
                 trust_remote_code=True,
                 use_cache=False,
-                attn_implementation="eager" if not USE_MEMORY_EFFICIENT_ATTENTION else "flash_attention_2"
+                attn_implementation="eager"  # Always use eager implementation for compatibility
             )
         except Exception as e:
             print(f"Error loading with custom device map: {e}")
             print("Falling back to automatic device map...")
             
-            # Fallback to simpler device map with auto distribution
-            cleanup_memory()  # Clean up memory before retrying
+            # Perform deep cleanup for Kaggle environment
+            for _ in range(3):  # Multiple cleanup passes
+                cleanup_memory()  
+                time.sleep(1)  # Give the system time to reclaim memory
             
-            # Try again with simpler configuration
+            # Try again with much simpler configuration optimized for Kaggle
+            print("Using simplified auto device mapping for maximum compatibility...")
+            
+            # Create simpler BnB config for auto device mapping
+            simple_bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True
+            )
+            
+            # Kaggle-optimized max memory settings - be very conservative
+            kaggle_max_memory = {
+                0: "8GB",          # Very conservative GPU 0 limit for Kaggle 
+                1: "8GB",          # Very conservative GPU 1 limit for Kaggle
+                "cpu": "24GB",     # Limited CPU memory for Kaggle
+            }
+            
             model = AutoModelForCausalLM.from_pretrained(
                 MODEL_NAME,
-                quantization_config=bnb_config,
-                device_map="auto",  # Let HF decide automatically
-                offload_folder=offload_folder,
-                offload_state_dict=True,
-                max_memory={0: "10GB", 1: "10GB", "cpu": "30GB"},  # Limit memory usage
+                quantization_config=simple_bnb_config,
+                device_map="auto",  # Let HF decide automatically - most compatible option
+                max_memory=kaggle_max_memory,  # Conservative memory limits for Kaggle
+                low_cpu_mem_usage=True,  # More aggressive CPU memory optimization
                 torch_dtype=torch.float16,
                 trust_remote_code=True,
                 use_cache=False
@@ -1335,15 +1541,26 @@ try:
         # More conservative memory allocation strategy
         torch.cuda.set_per_process_memory_fraction(0.85)  # Reserve more memory (15%) for system
         
-        # Try to enable memory-efficient attention if available
-        try:
-            from transformers.utils import is_flash_attn_available
-            if is_flash_attn_available():
-                print("Flash Attention is available and will be used")
-            else:
-                print("Flash Attention not available, using standard attention")
-        except ImportError:
-            pass
+        # For Kaggle, use the most reliable attention mechanism rather than Flash Attention
+        print("Using standard attention for maximum Kaggle compatibility")
+            
+        # Configure CUDA memory usage more conservatively for Kaggle
+        if torch.cuda.is_available():
+            # Set more conservative memory fraction for Kaggle's T4 GPUs
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Reserve 20% for Kaggle system
+                
+            # For Kaggle's T4 GPUs, avoid enabling TF32 which can consume more memory
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+                
+            # Explicitly disable any caching mechanisms that could leak memory
+            torch.backends.cudnn.benchmark = False
+                
+            print("Configured CUDA memory settings for Kaggle environment")
+                
+        # Set additional environment variables specifically for Kaggle
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable tokenizer parallelism to save memory
     
     # Set up a memory monitor thread for continuous monitoring during training
     def memory_monitoring_thread():
