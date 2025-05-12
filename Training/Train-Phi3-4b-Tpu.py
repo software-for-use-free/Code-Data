@@ -18,12 +18,23 @@
 # This notebook trains Microsoft's Phi-3-mini-128k-instruct model to understand and work with Swift code using a dataset of real Swift files. This version is specifically optimized for TPU training.
 
 # %%
-# Install required libraries
-!pip install transformers datasets evaluate torch scikit-learn tqdm dropbox requests accelerate peft 'torch_xla[tpu]>=2.0'
+# Install required libraries with specific versions to ensure compatibility
+!pip install -q -U numpy
+!pip install -q torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0
+!pip install -q 'torch_xla[tpu]==2.1.0' -f https://storage.googleapis.com/libtpu-releases/index.html
+!pip install -q transformers==4.38.1 datasets==2.16.1 evaluate==0.4.1 scikit-learn tqdm dropbox requests accelerate==0.28.0 peft==0.7.1
 
 # Set environment variables for TPU
 import os
-os.environ["TPU_NAME"] = "local"  # For Google Cloud TPU environments, set appropriately
+# Check for TPU environment and set appropriate variables
+if "COLAB_TPU_ADDR" in os.environ:
+    print(f"Setting up Colab TPU: {os.environ['COLAB_TPU_ADDR']}")
+    os.environ["XLA_USE_BF16"] = "1"  # Enable bfloat16 for better performance
+elif "TPU_NAME" in os.environ:  
+    print(f"Using Cloud TPU: {os.environ['TPU_NAME']}")
+else:
+    print("No TPU environment detected, setting to local")
+    os.environ["TPU_NAME"] = "local"
 
 # %%
 # Import required libraries
@@ -36,6 +47,9 @@ import psutil
 import os
 import gc
 import json
+import sys
+import logging
+import traceback
 import transformers
 from datasets import load_dataset
 from transformers import (
@@ -48,67 +62,190 @@ from transformers import (
 from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# Import TPU-specific libraries
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
-from torch_xla.distributed.parallel_loader import ParallelLoader
-import torch_xla.debug.metrics as met
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# TPU detection and imports with error handling
+TPU_AVAILABLE = False
+try:
+    # Try to import TPU-specific libraries
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    from torch_xla.distributed.parallel_loader import ParallelLoader
+    import torch_xla.debug.metrics as met
+    
+    # Verify TPU is actually available
+    if torch_xla.xla_device_hw(devkind='TPU') is not None:
+        TPU_AVAILABLE = True
+        logger.info("TPU detected and PyTorch XLA successfully imported")
+    else:
+        logger.warning("PyTorch XLA imported but no TPU devices detected")
+        
+except ImportError as e:
+    logger.warning(f"Could not import PyTorch XLA. TPU will not be available. Error: {e}")
+    # Create placeholder functions/objects for graceful fallback
+    class XMPlaceholder:
+        @staticmethod
+        def xla_device(): return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        @staticmethod
+        def mark_step(): pass
+        @staticmethod
+        def xrt_world_size(): return 1
+        @staticmethod
+        def get_ordinal(): return 0
+        @staticmethod
+        def get_local_ordinal(): return 0
+        @staticmethod
+        def get_device_type(): return 'CPU' if not torch.cuda.is_available() else 'GPU'
+        @staticmethod
+        def is_master_ordinal(): return True
+        @staticmethod
+        def master_print(msg): print(msg)
+        @staticmethod
+        def rendezvous(tag): pass
+        
+    class MetPlaceholder:
+        @staticmethod
+        def metrics_report(): return "TPU metrics not available"
+    
+    # Set up fallback placeholders
+    xm = XMPlaceholder()
+    met = MetPlaceholder()
+    TPU_AVAILABLE = False
 
 # Define memory cleanup function for TPU
 def cleanup_memory():
     """Clean up memory to avoid fragmentation."""
-    print("Cleaning up memory...")
+    logger.info("Cleaning up memory...")
+    
+    # Force garbage collection
     gc.collect()
-    if xm.xrt_world_size() > 0:
-        # For TPU, synchronize after cleanup
-        xm.mark_step()
-        print("TPU memory synchronized")
+    
+    # Empty CUDA cache if CUDA is available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("CUDA cache cleared")
+    
+    # Synchronize TPU operations if TPU is available
+    if TPU_AVAILABLE and xm.xrt_world_size() > 0:
+        try:
+            xm.mark_step()
+            logger.info("TPU memory synchronized")
+        except Exception as e:
+            logger.warning(f"Error during TPU synchronization: {e}")
         
-# Define resource monitoring function for TPU
+# Define resource monitoring function for TPU and GPU
 def monitor_resources():
-    """Monitor system and TPU resources."""
+    """Monitor system and accelerator (TPU/GPU) resources."""
     # Monitor CPU and RAM
     process = psutil.Process(os.getpid())
     memory_info = process.memory_info()
-    print(f"CPU memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
+    mem = psutil.virtual_memory()
+    
+    logger.info(f"CPU memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
+    logger.info(f"System memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available")
+    
+    # Monitor GPU if available
+    if torch.cuda.is_available() and not TPU_AVAILABLE:
+        for i in range(torch.cuda.device_count()):
+            logger.info(f"GPU {i} ({torch.cuda.get_device_name(i)}): "
+                  f"{torch.cuda.memory_allocated(i) / 1024 / 1024:.2f} MB allocated, "
+                  f"{torch.cuda.memory_reserved(i) / 1024 / 1024:.2f} MB reserved")
     
     # Monitor TPU if available
-    if xm.xrt_world_size() > 0:
-        print(f"TPU device: {xm.get_device_type()}")
-        print(f"Number of TPU devices: {xm.xrt_world_size()}")
-        
-        # Print TPU memory usage metrics
-        print("\nTPU Memory Usage:")
-        tpu_metrics = met.metrics_report()
-        print(tpu_metrics)
-        
-        # Extract and print specific TPU memory metrics if available
-        memory_metrics = [m for m in str(tpu_metrics).split('\n') if 'mem' in m.lower()]
-        for metric in memory_metrics:
-            print(f"  {metric}")
+    if TPU_AVAILABLE and xm.xrt_world_size() > 0:
+        try:
+            logger.info(f"TPU device: {xm.get_device_type()}")
+            logger.info(f"Number of TPU devices: {xm.xrt_world_size()}")
+            
+            # Get TPU memory metrics
+            tpu_metrics = met.metrics_report()
+            
+            # Extract and log TPU memory-related metrics
+            metrics_str = str(tpu_metrics)
+            memory_metrics = [m for m in metrics_str.split('\n') 
+                             if any(word in m.lower() for word in ['mem', 'memory', 'ram'])]
+            
+            if memory_metrics:
+                logger.info("TPU Memory Metrics:")
+                for metric in memory_metrics:
+                    logger.info(f"  {metric}")
+            
+            # Check for potential issues or errors in metrics
+            error_indicators = ['oom', 'error', 'out of memory']
+            errors = [m for m in metrics_str.split('\n') 
+                     if any(indicator in m.lower() for indicator in error_indicators)]
+            
+            if errors:
+                logger.warning("Potential TPU issues detected:")
+                for error in errors:
+                    logger.warning(f"  {error}")
+                    
+        except Exception as e:
+            logger.error(f"Error monitoring TPU resources: {e}")
+            logger.debug(traceback.format_exc())
 
 
 # %%
-# Configure TPU device
-device = xm.xla_device()
-print(f"Using device: {device}")
-print(f"Number of TPU devices: {xm.xrt_world_size()}")
-print(f"TPU type: {xm.get_device_type()}")
-
-# Print TPU configuration details
-if xm.xrt_world_size() > 0:
-    print("TPU Configuration:")
-    print(f"  TPU cores: {xm.xrt_world_size()}")
-    print(f"  Local ordinal: {xm.get_local_ordinal()}")
-    print(f"  Global ordinal: {xm.get_ordinal()}")
+# Configure device (TPU, GPU, or CPU)
+def setup_device():
+    """Set up the appropriate device based on what's available."""
+    if TPU_AVAILABLE:
+        try:
+            device = xm.xla_device()
+            logger.info(f"Using TPU device: {device}")
+            logger.info(f"Number of TPU devices: {xm.xrt_world_size()}")
+            logger.info(f"TPU type: {xm.get_device_type()}")
+            
+            # Print TPU configuration details
+            logger.info("TPU Configuration:")
+            logger.info(f"  TPU cores: {xm.xrt_world_size()}")
+            logger.info(f"  Local ordinal: {xm.get_local_ordinal()}")
+            logger.info(f"  Global ordinal: {xm.get_ordinal()}")
+            
+            # Verify TPU is actually working with a small tensor operation
+            test_tensor = torch.randn(2, 2)
+            test_tensor = test_tensor.to(device)
+            _ = test_tensor + test_tensor  # Simple operation to verify device works
+            xm.mark_step()  # Sync TPU
+            logger.info("✅ TPU verification passed")
+            
+            return device, "tpu"
+            
+        except Exception as e:
+            logger.warning(f"TPU initialization failed: {e}")
+            logger.warning("Falling back to GPU or CPU")
+            TPU_AVAILABLE = False
+    
+    # Fall back to GPU if available
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"Number of GPUs available: {torch.cuda.device_count()}")
+        return device, "gpu"
+    
+    # Fall back to CPU as last resort
+    device = torch.device("cpu")
+    logger.info("Using CPU device")
+    return device, "cpu"
 
 # Set random seeds for reproducibility
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    
+# Setup device
+device, device_type = setup_device()
+logger.info(f"Device setup complete. Using: {device_type.upper()}")
+
+# Monitor initial resource usage
+monitor_resources()
 
 # %%
 # Dataset configuration - using the same dataset as the original notebook
@@ -116,15 +253,39 @@ DATASET_ID = "mvasiliniuc/iva-swift-codeint"
 
 # Model configuration - using Phi-3-mini-128k-instruct
 MODEL_NAME = "microsoft/Phi-3-mini-128k-instruct"
-MAX_LENGTH = 2048  # Reduced from 4096 to save memory
-BATCH_SIZE = 1  # Reduced batch size to avoid OOM errors
+
+# Set device-specific parameters based on what's available
+if device_type == "tpu":
+    MAX_LENGTH = 2048  # Reduced from 4096 to save memory on TPU
+    BATCH_SIZE = 1  # Reduced batch size to avoid OOM errors on TPU
+    GRADIENT_ACCUMULATION_STEPS = 8  # Increased to compensate for smaller batch size
+    # Use bfloat16 on TPU for better performance/memory usage
+    MODEL_DTYPE = torch.bfloat16
+elif device_type == "gpu":
+    # GPU configuration - can handle more if GPU has enough VRAM
+    if torch.cuda.get_device_properties(0).total_memory > 16e9:  # >16GB VRAM
+        MAX_LENGTH = 2048
+        BATCH_SIZE = 2
+        GRADIENT_ACCUMULATION_STEPS = 4
+    else:  # Smaller GPU
+        MAX_LENGTH = 1024
+        BATCH_SIZE = 1
+        GRADIENT_ACCUMULATION_STEPS = 8
+    # Use float16 on GPU for better performance
+    MODEL_DTYPE = torch.float16
+else:  # CPU fallback
+    MAX_LENGTH = 512  # Much smaller for CPU
+    BATCH_SIZE = 1
+    GRADIENT_ACCUMULATION_STEPS = 16
+    MODEL_DTYPE = torch.float32  # Full precision on CPU
+
+# Common parameters
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 3
 WARMUP_RATIO = 0.03
-GRADIENT_ACCUMULATION_STEPS = 8  # Increased to compensate for smaller batch size
 
-# LoRA configuration
+# LoRA configuration - helps with memory efficiency on all devices
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
@@ -133,11 +294,24 @@ LORA_DROPOUT = 0.05
 DEBUG_MODE = False
 DEBUG_SAMPLE_SIZE = 100
 
-print(f"Using model: {MODEL_NAME}")
-print(f"Max sequence length: {MAX_LENGTH}")
-print(f"Batch size: {BATCH_SIZE} per device")
-print(f"Effective batch size: {BATCH_SIZE * xm.xrt_world_size() * GRADIENT_ACCUMULATION_STEPS}")
-print(f"LoRA rank: {LORA_R}")
+# Calculate effective batch size
+if device_type == "tpu":
+    num_devices = xm.xrt_world_size()
+elif device_type == "gpu":
+    num_devices = torch.cuda.device_count()
+else:
+    num_devices = 1
+
+EFFECTIVE_BATCH_SIZE = BATCH_SIZE * num_devices * GRADIENT_ACCUMULATION_STEPS
+
+logger.info(f"Using model: {MODEL_NAME}")
+logger.info(f"Max sequence length: {MAX_LENGTH}")
+logger.info(f"Batch size: {BATCH_SIZE} per device")
+logger.info(f"Number of devices: {num_devices}")
+logger.info(f"Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}")
+logger.info(f"Effective batch size: {EFFECTIVE_BATCH_SIZE}")
+logger.info(f"Using model dtype: {MODEL_DTYPE}")
+logger.info(f"LoRA rank: {LORA_R}")
 
 
 # %%
@@ -596,42 +770,73 @@ except Exception as e:
     raise
 
 # %%
-# Set up training arguments with optimized settings for TPU training
+# Set up training arguments based on device type
 try:
     # Create output directory if it doesn't exist
-    os.makedirs("./phi3_tpu_swift_model", exist_ok=True)
+    model_output_dir = f"./phi3_{device_type}_swift_model"
+    os.makedirs(model_output_dir, exist_ok=True)
     
-    # Configure training arguments with TPU-specific settings
-    training_args = TrainingArguments(
-        output_dir="./phi3_tpu_swift_model",
-        num_train_epochs=NUM_EPOCHS,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        learning_rate=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-        warmup_ratio=WARMUP_RATIO,
-        logging_dir="./logs",
-        logging_steps=10,
-        save_steps=500,
-        save_total_limit=2,
-        eval_strategy="steps",
-        eval_steps=500,
-        load_best_model_at_end=True,
+    # Define training argument dict with common parameters
+    training_args_dict = {
+        "output_dir": model_output_dir,
+        "num_train_epochs": NUM_EPOCHS,
+        "per_device_train_batch_size": BATCH_SIZE,
+        "per_device_eval_batch_size": BATCH_SIZE,
+        "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "warmup_ratio": WARMUP_RATIO,
+        "logging_dir": f"./logs/{device_type}",
+        "logging_steps": 10,
+        "save_steps": 500,
+        "save_total_limit": 2,
+        "evaluation_strategy": "steps",
+        "eval_steps": 500,
+        "load_best_model_at_end": True,
+        "report_to": "none",  # Disable reporting to reduce overhead
+        "gradient_checkpointing": True,  # Enable gradient checkpointing to save memory
+    }
+    
+    # Add device-specific settings
+    if device_type == "tpu":
         # TPU-specific settings
-        tpu_num_cores=8,  # Specify the number of TPU cores
-        dataloader_num_workers=2,
-        dataloader_pin_memory=False,
-        report_to="none",  # Disable reporting to avoid extra overhead
-        gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
-    )
+        training_args_dict.update({
+            "tpu_num_cores": 8,  # Specify the number of TPU cores
+            "dataloader_num_workers": 2,
+            "dataloader_pin_memory": False,
+            "fp16": False,  # TPUs prefer bfloat16 over fp16
+            "bf16": True,  # Enable bfloat16 for TPUs
+        })
+    elif device_type == "gpu":
+        # GPU-specific settings
+        training_args_dict.update({
+            "dataloader_num_workers": 4,
+            "dataloader_pin_memory": True,
+            "fp16": True,  # Enable mixed precision training on GPUs
+            "bf16": False,
+            "half_precision_backend": "auto",
+        })
+    else:  # CPU
+        # CPU-specific settings
+        training_args_dict.update({
+            "dataloader_num_workers": 0,
+            "dataloader_pin_memory": False,
+            "fp16": False,
+            "bf16": False,
+        })
     
-    print(f"Training arguments configured for TPU training")
-    print(f"Using gradient checkpointing: {training_args.gradient_checkpointing}")
-    print(f"TPU cores: {training_args.tpu_num_cores}")
+    # Create training arguments
+    training_args = TrainingArguments(**training_args_dict)
+    
+    logger.info(f"Training arguments configured for {device_type.upper()} training")
+    logger.info(f"Using gradient checkpointing: {training_args.gradient_checkpointing}")
+    
+    if device_type == "tpu":
+        logger.info(f"TPU cores: {training_args.tpu_num_cores}")
     
 except Exception as e:
-    print(f"Error setting up training arguments: {e}")
+    logger.error(f"Error setting up training arguments: {e}")
+    logger.error(traceback.format_exc())
     raise
 
 # %%
@@ -660,30 +865,69 @@ class TPUMetricsCallback(transformers.TrainerCallback):
                 for metric in memory_metrics:
                     xm.master_print(f"  {metric}")
 
-# Load and prepare the model for TPU
+# Load and prepare the model with device-specific optimizations
 try:
-    print(f"Loading {MODEL_NAME} for TPU...")
+    logger.info(f"Loading {MODEL_NAME} for {device_type.upper()}...")
     
     # Clean up memory before model loading
     cleanup_memory()
     
-    # For TPU, we'll use a different approach to model loading compared to 4-bit quantization
-    # TPUs work better with standard precision models (bf16 or fp32)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.bfloat16,  # BF16 is efficient on TPUs
-        trust_remote_code=True,
-        use_cache=False  # Disable KV cache during training for better memory efficiency
-    )
+    # Define model loading parameters based on device
+    model_loading_kwargs = {
+        "trust_remote_code": True,
+        "use_cache": False,  # Disable KV cache during training for better memory efficiency
+    }
     
-    # Move the model to TPU device
-    model.to(device)
-    print(f"Successfully loaded model on TPU")
+    # Set device-specific model loading parameters
+    if device_type == "tpu":
+        model_loading_kwargs.update({
+            "torch_dtype": MODEL_DTYPE,  # bfloat16 for TPU
+            "low_cpu_mem_usage": True,
+            "load_in_8bit": False,
+        })
+    elif device_type == "gpu":
+        model_loading_kwargs.update({
+            "torch_dtype": MODEL_DTYPE,  # float16 for GPU
+            "low_cpu_mem_usage": True,
+            # For GPUs with limited memory, add device_map for better memory efficiency
+            "device_map": "auto" if torch.cuda.get_device_properties(0).total_memory < 24e9 else None,
+        })
+    else:  # cpu
+        model_loading_kwargs.update({
+            "torch_dtype": MODEL_DTYPE,  # float32 for CPU
+            "low_cpu_mem_usage": True,
+        })
+    
+    # Load the model with the specified parameters
+    logger.info(f"Loading model with parameters: {model_loading_kwargs}")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **model_loading_kwargs)
+    
+    # For TPU or Standard GPU, we need to explicitly move model to device
+    if device_type in ["tpu", "gpu"] and "device_map" not in model_loading_kwargs:
+        logger.info(f"Moving model to {device}...")
+        model = model.to(device)
+    
+    # Verify model is loaded on the correct device
+    model_device = next(model.parameters()).device
+    logger.info(f"Model loaded on device: {model_device}")
     
     # Configure LoRA for efficient fine-tuning
-    print("Setting up LoRA fine-tuning...")
+    logger.info("Setting up LoRA fine-tuning...")
+    
     # Get label names from category names
     label_names = [category_names[i] for i in range(len(category_names))]
+    
+    # Configure optimized target modules based on model architecture
+    # Identify what modules are in the model to avoid errors
+    model_modules = [name for name, _ in model.named_modules()]
+    
+    # Default set of modules to target
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    
+    # Ensure we only target modules that actually exist in the model
+    target_modules = [name for name in target_modules if any(name in module for module in model_modules)]
+    
+    logger.info(f"Targeting LoRA modules: {target_modules}")
     
     lora_config = LoraConfig(
         r=LORA_R,
@@ -691,59 +935,229 @@ try:
         lora_dropout=LORA_DROPOUT,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=target_modules,
         label_names=label_names
     )
     
-    # Prepare model for LoRA fine-tuning
+    # Apply LoRA to model
+    logger.info("Applying LoRA adapter to model...")
     model = get_peft_model(model, lora_config)
     
-    # Print information about the model
-    print(f"Model loaded and configured with LoRA (rank={LORA_R})")
-    print(f"Model architecture: {model.__class__.__name__}")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
+    # Print model information
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
     
-    # Print TPU device allocation
-    print(f"Model is on TPU device: {next(model.parameters()).device}")
+    logger.info(f"Model loaded and configured with LoRA (rank={LORA_R})")
+    logger.info(f"Model architecture: {model.__class__.__name__}")
+    logger.info(f"Total parameters: {total_params:.2f}M")
+    logger.info(f"Trainable parameters: {trainable_params:.2f}M")
+    logger.info(f"Parameter efficiency: {trainable_params/total_params*100:.2f}%")
     
-    # Print TPU memory info
-    print("TPU Memory Status after model loading:")
-    print(met.metrics_report())
+    # Monitor device status after model loading
+    monitor_resources()
     
 except Exception as e:
-    print(f"Error loading model: {e}")
-    import traceback
-    traceback.print_exc()
-    raise
+    logger.error(f"Error loading model: {e}")
+    logger.error(traceback.format_exc())
+    
+    # Try fallback to CPU if model loading on accelerator failed
+    if device_type != "cpu":
+        logger.warning(f"Attempting fallback to CPU...")
+        try:
+            device = torch.device("cpu")
+            device_type = "cpu"
+            MODEL_DTYPE = torch.float32
+            
+            # Adjust training parameters for CPU
+            MAX_LENGTH = 512
+            BATCH_SIZE = 1
+            GRADIENT_ACCUMULATION_STEPS = 16
+            
+            # Load model on CPU
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                use_cache=False
+            )
+            
+            logger.info("Successfully loaded model on CPU as fallback")
+        except Exception as cpu_e:
+            logger.error(f"CPU fallback also failed: {cpu_e}")
+            raise
+    else:
+        raise
 
 # %%
-# Create a custom data collator for TPU
-class CustomDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
+# Create a device-optimized data collator for efficient training
+class DeviceOptimizedDataCollator(DataCollatorForLanguageModeling):
+    """Data collator optimized for different device types (TPU, GPU, CPU)"""
+    
+    def __init__(self, tokenizer, mlm=False, device_type="tpu"):
+        super().__init__(tokenizer=tokenizer, mlm=mlm)
+        self.device_type = device_type
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        logger.info(f"Initialized {device_type.upper()}-optimized data collator")
+    
     def __call__(self, features):
         # Ensure all features have the same keys
         if not all(k in features[0] for k in ["input_ids", "attention_mask", "labels"]):
-            raise ValueError("Some features are missing required keys")
+            logger.warning("Some features are missing required keys in batch")
+            # Attempt to fix by ensuring all features have the required keys
+            for feature in features:
+                for key in ["input_ids", "attention_mask", "labels"]:
+                    if key not in feature:
+                        if key == "labels":
+                            feature[key] = feature.get("input_ids", []).copy()
+                        else:
+                            # Create empty tensor with right dtype
+                            feature[key] = torch.tensor([], dtype=torch.long)
         
-        # Create a batch with proper padding
-        batch = {
-            "input_ids": torch.stack([f["input_ids"] for f in features]),
-            "attention_mask": torch.stack([f["attention_mask"] for f in features]),
-            "labels": torch.stack([f["labels"] for f in features])
-        }
-        
-        return batch
+        try:
+            # Create batch dictionary
+            batch = {
+                "input_ids": torch.stack([f["input_ids"] for f in features]),
+                "attention_mask": torch.stack([f["attention_mask"] for f in features]),
+                "labels": torch.stack([f["labels"] for f in features])
+            }
+            
+            # Device-specific optimizations
+            if self.device_type == "tpu":
+                # For TPU, we need to ensure tensors have proper shapes and dtypes
+                # XLA prefers static shapes
+                for key in batch:
+                    # Ensure int64 dtype for TPU
+                    if batch[key].dtype != torch.int64:
+                        batch[key] = batch[key].to(torch.int64)
+            
+            return batch
+            
+        except Exception as e:
+            logger.error(f"Error in data collation: {e}")
+            logger.error(traceback.format_exc())
+            
+            # Fallback: Process one example at a time to identify the problematic feature
+            logger.warning("Attempting fallback collation...")
+            
+            # Find the max length in this batch to use for padding
+            max_length = max(len(f["input_ids"]) for f in features)
+            
+            # Manually create batches with careful padding
+            input_ids = []
+            attention_mask = []
+            labels = []
+            
+            for feature in features:
+                # Pad input_ids
+                padded_input_ids = feature["input_ids"].tolist() + [self.pad_token_id] * (max_length - len(feature["input_ids"]))
+                input_ids.append(torch.tensor(padded_input_ids, dtype=torch.long))
+                
+                # Pad attention_mask
+                padded_attention_mask = feature["attention_mask"].tolist() + [0] * (max_length - len(feature["attention_mask"]))
+                attention_mask.append(torch.tensor(padded_attention_mask, dtype=torch.long))
+                
+                # Pad labels
+                padded_labels = feature["labels"].tolist() + [-100] * (max_length - len(feature["labels"]))
+                labels.append(torch.tensor(padded_labels, dtype=torch.long))
+            
+            batch = {
+                "input_ids": torch.stack(input_ids),
+                "attention_mask": torch.stack(attention_mask),
+                "labels": torch.stack(labels)
+            }
+            
+            logger.info("Fallback collation successful")
+            return batch
 
-# Create data collator for language modeling
-data_collator = CustomDataCollatorForLanguageModeling(
+# Create data collator optimized for the current device
+data_collator = DeviceOptimizedDataCollator(
     tokenizer=tokenizer,
-    mlm=False  # We're doing causal language modeling, not masked language modeling
+    mlm=False,  # We're doing causal language modeling, not masked language modeling
+    device_type=device_type
 )
+logger.info(f"Created {device_type}-optimized data collator")
 
 # %%
-# Create TPU-specific trainer
-tpu_metrics_callback = TPUMetricsCallback()
+# Create device-optimized callbacks based on device type
+class DeviceMetricsCallback(transformers.TrainerCallback):
+    """Callback to monitor metrics for different device types"""
+    
+    def __init__(self, device_type):
+        self.device_type = device_type
+        logger.info(f"Initialized {device_type} metrics callback")
+        
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+            
+        # Log metrics based on device type
+        if self.device_type == "tpu" and TPU_AVAILABLE:
+            xm.master_print(f"TPU Step {state.global_step}: {logs}")
+            
+            # Log TPU metrics periodically
+            if state.global_step % 50 == 0:
+                try:
+                    tpu_metrics = met.metrics_report()
+                    metrics_str = str(tpu_metrics)
+                    
+                    # Extract and print TPU memory metrics
+                    memory_metrics = [m for m in metrics_str.split('\n') 
+                                     if any(word in m.lower() for word in ['mem', 'memory'])]
+                    
+                    if memory_metrics:
+                        xm.master_print("\nTPU Memory Metrics:")
+                        for metric in memory_metrics:
+                            xm.master_print(f"  {metric}")
+                except Exception as e:
+                    logger.warning(f"Error getting TPU metrics: {e}")
+                
+        elif self.device_type == "gpu":
+            if state.global_step % 50 == 0 and torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    logger.info(f"GPU {i} ({torch.cuda.get_device_name(i)}): "
+                         f"{torch.cuda.memory_allocated(i) / 1024 / 1024:.2f} MB allocated, "
+                         f"{torch.cuda.memory_reserved(i) / 1024 / 1024:.2f} MB reserved")
+                    
+    def on_step_end(self, args, state, control, **kwargs):
+        # Device-specific syncing and memory management
+        if self.device_type == "tpu" and TPU_AVAILABLE:
+            # TPU-specific step end operations
+            try:
+                xm.mark_step()  # Ensure TPU operations complete
+                
+                # Check if we're hitting memory pressure
+                if state.global_step % 100 == 0:
+                    metrics = met.metrics_report()
+                    metrics_str = str(metrics)
+                    
+                    # Look for memory pressure indicators
+                    if any(warning in metrics_str.lower() for warning in ["oom", "out of memory", "resource exhausted"]):
+                        logger.warning("⚠️ TPU memory pressure detected!")
+                        # Force garbage collection
+                        gc.collect()
+                        xm.mark_step()  # Ensure sync after cleanup
+            except Exception as e:
+                logger.warning(f"Error in TPU step end operations: {e}")
+                
+        elif self.device_type == "gpu" and torch.cuda.is_available():
+            # GPU-specific operations for memory monitoring
+            if state.global_step % 100 == 0:
+                # Empty cache periodically to reduce fragmentation
+                torch.cuda.empty_cache()
 
+# Initialize early stopping callback
+early_stopping_callback = EarlyStoppingCallback(
+    early_stopping_patience=3,
+    early_stopping_threshold=0.01
+)
+
+# Create device metrics callback
+device_metrics_callback = DeviceMetricsCallback(device_type)
+
+# Configure callbacks based on device type
+callbacks = [early_stopping_callback, device_metrics_callback]
+
+# Create the trainer with device-optimized settings
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -751,20 +1165,21 @@ trainer = Trainer(
     eval_dataset=tokenized_val,
     tokenizer=tokenizer,
     data_collator=data_collator,
-    callbacks=[early_stopping_callback, tpu_metrics_callback]
+    callbacks=callbacks
 )
 
 # Verify model device
 model_device = next(model.parameters()).device
-print(f"Model is on TPU device: {model_device}")
+logger.info(f"Model is on device: {model_device}")
 
-print("TPU training setup complete")
+logger.info(f"{device_type.upper()} training setup complete")
 
 
 # %%
-# Function to monitor TPU resources during training
-def monitor_tpu_resources():
-    print(f"\nTPU Resources:")
+# Function to monitor device resources during training
+def monitor_training_resources():
+    """Monitor system and accelerator resources during training."""
+    logger.info(f"\n{device_type.upper()} Resources:")
     
     # Monitor CPU memory (for host)
     process = psutil.Process(os.getpid())
@@ -772,128 +1187,180 @@ def monitor_tpu_resources():
     mem = psutil.virtual_memory()
     cpu_percent = psutil.cpu_percent(interval=0.1)
     
-    print(f"CPU Usage: {cpu_percent}%")
-    print(f"Process Memory: {memory_info.rss / 1024 / 1024:.2f} MB")
-    print(f"System Memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available")
+    logger.info(f"CPU Usage: {cpu_percent}%")
+    logger.info(f"Process Memory: {memory_info.rss / 1024 / 1024:.2f} MB")
+    logger.info(f"System Memory: {mem.percent}% used, {mem.available / 1024 / 1024:.2f} MB available")
     
-    # Monitor TPU memory and metrics
-    if xm.xrt_world_size() > 0:
-        print("\nTPU Metrics:")
-        tpu_metrics = met.metrics_report()
-        
-        # Print memory related metrics
-        print("\nTPU Memory Usage:")
-        metrics_str = str(tpu_metrics)
-        
-        # Extract memory metrics
-        memory_metrics = [m for m in metrics_str.split('\n') 
-                         if any(word in m.lower() for word in ['mem', 'memory', 'ram'])]
-        
-        for metric in memory_metrics:
-            print(f"  {metric}")
-        
-        # Extract compilation metrics
-        compilation_metrics = [m for m in metrics_str.split('\n') 
-                              if any(word in m.lower() for word in ['compile', 'xla', 'execution'])]
-        
-        print("\nTPU Compilation Metrics:")
-        for metric in compilation_metrics:
-            print(f"  {metric}")
-        
-        # Check for TPU errors or problems
-        error_metrics = [m for m in metrics_str.split('\n') 
-                        if any(word in m.lower() for word in ['error', 'timeout', 'fail'])]
-        
-        if error_metrics:
-            print("\n⚠️ TPU Error Metrics:")
-            for metric in error_metrics:
-                print(f"  {metric}")
-    print("")
+    # Device-specific monitoring
+    if device_type == "tpu" and TPU_AVAILABLE:
+        try:
+            logger.info("\nTPU Metrics:")
+            tpu_metrics = met.metrics_report()
+            metrics_str = str(tpu_metrics)
+            
+            # Extract and log important metrics
+            metric_categories = {
+                "Memory": ['mem', 'memory', 'ram'],
+                "Compilation": ['compile', 'xla', 'execution'],
+                "Errors": ['error', 'timeout', 'fail', 'oom', 'out of memory']
+            }
+            
+            for category, keywords in metric_categories.items():
+                filtered_metrics = [m for m in metrics_str.split('\n') 
+                                  if any(word in m.lower() for word in keywords)]
+                
+                if filtered_metrics:
+                    prefix = "⚠️ " if category == "Errors" else ""
+                    logger.info(f"\n{prefix}TPU {category} Metrics:")
+                    for metric in filtered_metrics:
+                        logger.info(f"  {metric}")
+        except Exception as e:
+            logger.warning(f"Error getting TPU metrics: {e}")
+    
+    elif device_type == "gpu" and torch.cuda.is_available():
+        try:
+            logger.info("\nGPU Metrics:")
+            for i in range(torch.cuda.device_count()):
+                gpu_name = torch.cuda.get_device_name(i)
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024 / 1024
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024 / 1024
+                mem_usage_percent = 100 * mem_allocated / mem_reserved if mem_reserved > 0 else 0
+                
+                logger.info(f"GPU {i} ({gpu_name}):")
+                logger.info(f"  Memory Allocated: {mem_allocated:.2f} MB")
+                logger.info(f"  Memory Reserved: {mem_reserved:.2f} MB")
+                logger.info(f"  Memory Usage: {mem_usage_percent:.2f}%")
+                
+                # Check for potential memory pressure
+                if mem_usage_percent > 90:
+                    logger.warning(f"⚠️ High GPU memory usage on GPU {i}: {mem_usage_percent:.2f}%")
+        except Exception as e:
+            logger.warning(f"Error getting GPU metrics: {e}")
+    
+    logger.info("")  # Empty line for readability
 
 # %%
-# Create a custom training loop with specific TPU management
+# Create a device-optimized training loop with proper error handling
 try:
-    print("Starting training with TPU-specific optimizations...")
+    logger.info(f"Starting training with {device_type.upper()}-optimized settings...")
     
     # Monitor resources before training
-    print("Resources before training:")
-    monitor_tpu_resources()
+    logger.info("Resources before training:")
+    monitor_training_resources()
     
     # Additional cleanup before training
     cleanup_memory()
     
-    # Custom TPU callback to monitor compilation and execution
-    class TPUGuardCallback(transformers.TrainerCallback):
-        """Custom callback for TPU monitoring and error prevention"""
+    # Add device-specific guard callback
+    class DeviceGuardCallback(transformers.TrainerCallback):
+        """Device-specific monitoring and error prevention callback"""
+        def __init__(self, device_type):
+            self.device_type = device_type
+            logger.info(f"Initialized {device_type} guard callback")
+        
         def on_step_end(self, args, state, control, **kwargs):
-            # Perform a TPU sync after each step to ensure operations complete
-            xm.mark_step()
-            
-            # Periodically monitor TPU resources
-            if state.global_step % 50 == 0:
-                xm.master_print(f"\nTPU status at step {state.global_step}:")
-                metrics = met.metrics_report()
-                
-                # Check if we're hitting memory issues
-                metrics_str = str(metrics)
-                if any(warning in metrics_str.lower() for warning in ["oom", "out of memory", "resource exhausted"]):
-                    xm.master_print("⚠️ TPU memory pressure detected!")
-                    # Force garbage collection
-                    gc.collect()
-                    # Mark step to ensure sync
+            # Device-specific operations after each step
+            if self.device_type == "tpu" and TPU_AVAILABLE:
+                try:
+                    # Perform a TPU sync after each step
                     xm.mark_step()
-                
-            # Do deeper analysis every 100 steps
-            if state.global_step % 100 == 0 and state.global_step > 0:
-                monitor_tpu_resources()
+                    
+                    # Periodically monitor TPU resources
+                    if state.global_step % 50 == 0:
+                        logger.info(f"TPU status at step {state.global_step}:")
+                        metrics = met.metrics_report()
+                        
+                        # Check for memory issues
+                        metrics_str = str(metrics)
+                        if any(warning in metrics_str.lower() for warning in ["oom", "out of memory", "resource exhausted"]):
+                            logger.warning("⚠️ TPU memory pressure detected!")
+                            # Force garbage collection
+                            gc.collect()
+                            xm.mark_step()  # Ensure sync
+                            
+                except Exception as e:
+                    logger.warning(f"Error in TPU step end handling: {e}")
+            
+            elif self.device_type == "gpu" and torch.cuda.is_available():
+                # Periodically monitor GPU usage
+                if state.global_step % 100 == 0 and state.global_step > 0:
+                    # Clear cache periodically to prevent fragmentation
+                    torch.cuda.empty_cache()
+            
+            # Do deeper analysis every 200 steps for all device types
+            if state.global_step % 200 == 0 and state.global_step > 0:
+                monitor_training_resources()
                     
         def on_epoch_end(self, args, state, control, **kwargs):
             # Clean up between epochs
+            logger.info(f"Completed epoch {state.epoch}")
             gc.collect()
-            xm.mark_step()
-            xm.master_print("\nCompleted epoch - TPU sync point")
+            
+            if self.device_type == "tpu" and TPU_AVAILABLE:
+                xm.mark_step()
+                logger.info("TPU sync point at epoch end")
+            elif self.device_type == "gpu" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("GPU cache cleared at epoch end")
     
-    # Add our TPU monitoring callback
-    trainer.add_callback(TPUGuardCallback())
+    # Add our device monitoring callback
+    trainer.add_callback(DeviceGuardCallback(device_type))
     
     # Start training with a timeout
     max_training_time = 6 * 60 * 60  # 6 hours max
     start_time = time.time()
     
-    # Run training with TPU error handling
+    # Run training with device-specific error handling
     try:
         # Train the model
-        print("\nStarting TPU training...")
+        logger.info(f"\nStarting {device_type.upper()} training...")
         train_result = trainer.train()
         
-        # Ensure all TPU operations are complete
-        xm.mark_step()
+        # Ensure device-specific operations are complete
+        if device_type == "tpu" and TPU_AVAILABLE:
+            xm.mark_step()
+        elif device_type == "gpu" and torch.cuda.is_available():
+            torch.cuda.synchronize()
         
     except Exception as e:
-        print(f"\n🛑 TPU training error: {e}")
+        logger.error(f"\n🛑 Training error on {device_type}: {e}")
+        logger.error(traceback.format_exc())
         
         # Try to diagnose the issue
-        print("TPU diagnostic information:")
-        print(met.metrics_report())
+        logger.info("Diagnostic information:")
+        monitor_training_resources()
         
         # Clean up and try to restart if possible
         gc.collect()
-        xm.mark_step()
+        if device_type == "tpu" and TPU_AVAILABLE:
+            xm.mark_step()
+        elif device_type == "gpu" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        if "memory" in str(e).lower() or "resource" in str(e).lower():
-            # If we hit memory issues, try reducing parameters
-            print("\nAttempting recovery with reduced parameters...")
+        # For common memory issues, try reducing parameters and retry
+        if any(err in str(e).lower() for err in ["memory", "resource", "cuda out of memory"]):
+            logger.warning("\nAttempting recovery with reduced parameters...")
             
             # Reduce sequence length if needed
+            old_max_len = MAX_LENGTH
             if MAX_LENGTH > 1024:
-                old_max_len = MAX_LENGTH
                 MAX_LENGTH = 1024
-                print(f"Reducing sequence length from {old_max_len} to {MAX_LENGTH}")
+            elif MAX_LENGTH > 512:
+                MAX_LENGTH = 512
+            else:
+                MAX_LENGTH = 256
+                
+            logger.info(f"Reducing sequence length from {old_max_len} to {MAX_LENGTH}")
             
             # Try with smaller batch size and more gradient accumulation
+            old_batch_size = training_args.per_device_train_batch_size
+            old_grad_accum = training_args.gradient_accumulation_steps
+            
             training_args.per_device_train_batch_size = 1
-            training_args.gradient_accumulation_steps = 16
-            print("Reduced batch size to 1 and increased gradient accumulation to 16")
+            training_args.gradient_accumulation_steps = old_grad_accum * 2
+            
+            logger.info(f"Reduced batch size from {old_batch_size} to 1 and increased gradient accumulation "
+                  f"from {old_grad_accum} to {training_args.gradient_accumulation_steps}")
             
             # Re-create trainer with updated settings
             trainer = Trainer(
@@ -903,109 +1370,157 @@ try:
                 eval_dataset=tokenized_val,
                 tokenizer=tokenizer,
                 data_collator=data_collator,
-                callbacks=[early_stopping_callback, TPUGuardCallback()]
+                callbacks=callbacks + [DeviceGuardCallback(device_type)]
             )
             
             # Try again with new settings
-            print("\nRetrying training with reduced TPU memory settings...")
+            logger.info(f"\nRetrying training with reduced memory settings...")
             train_result = trainer.train()
-            xm.mark_step()  # Final sync point
+            
+            # Sync operations after recovery training
+            if device_type == "tpu" and TPU_AVAILABLE:
+                xm.mark_step()
     
     # Monitor resources after training
-    print("\nResources after training:")
-    monitor_tpu_resources()
+    logger.info("\nResources after training:")
+    monitor_training_resources()
     
     # Print training results
     elapsed_time = time.time() - start_time
-    print(f"\nTraining completed in {elapsed_time/60:.2f} minutes")
-    print(f"Training loss: {train_result.metrics['train_loss']:.4f}")
+    logger.info(f"\nTraining completed in {elapsed_time/60:.2f} minutes")
+    logger.info(f"Training loss: {train_result.metrics['train_loss']:.4f}")
     
-    # Save the model - special handling for TPU
-    print("\nSynchronizing and saving model...")
-    xm.mark_step()  # Ensure all TPU operations complete before saving
+    # Save the model - with device-specific handling
+    logger.info("\nSaving model...")
     
-    # Save on TPU process 0 only to avoid conflicts
-    if xm.is_master_ordinal():
-        trainer.save_model("./phi3_tpu_swift_model")
+    # Define output paths
+    model_output_path = f"./phi3_{device_type}_swift_model"
+    adapter_output_path = f"./phi3_{device_type}_swift_model_adapter"
+    
+    if device_type == "tpu" and TPU_AVAILABLE:
+        # Ensure TPU operations complete before saving
+        xm.mark_step()
+        
+        # Save on TPU process 0 only to avoid conflicts
+        if xm.is_master_ordinal():
+            trainer.save_model(model_output_path)
+            
+            # Save adapter separately for easier loading
+            if hasattr(model, "save_pretrained"):
+                try:
+                    model.save_pretrained(adapter_output_path)
+                    logger.info(f"Saved LoRA adapter to {adapter_output_path}")
+                except Exception as save_error:
+                    logger.error(f"Error saving adapter: {save_error}")
+            
+            logger.info("Model saved successfully")
+        
+        # Final TPU synchronization
+        xm.rendezvous("training_complete")
+    else:
+        # For GPU/CPU we can save directly
+        trainer.save_model(model_output_path)
         
         # Save adapter separately for easier loading
         if hasattr(model, "save_pretrained"):
             try:
-                model.save_pretrained("./phi3_tpu_swift_model_adapter")
-                print("Saved LoRA adapter to ./phi3_tpu_swift_model_adapter")
+                model.save_pretrained(adapter_output_path)
+                logger.info(f"Saved LoRA adapter to {adapter_output_path}")
             except Exception as save_error:
-                print(f"Error saving adapter: {save_error}")
+                logger.error(f"Error saving adapter: {save_error}")
         
-        print("Model saved successfully")
+        logger.info("Model saved successfully")
     
-    # Final TPU synchronization
-    xm.rendezvous("training_complete")
-    print("TPU training complete")
+    logger.info(f"{device_type.upper()} training complete")
     
     # Clean up memory
     cleanup_memory()
     
 except Exception as e:
-    print(f"\n❌ Error during TPU training: {e}")
+    logger.error(f"\n❌ Error during {device_type} training: {e}")
+    logger.error(traceback.format_exc())
     
-    # Print stack trace for debugging
-    import traceback
-    traceback.print_exc()
-    
-    # Print TPU diagnostic information
-    print("\nTPU diagnostic information at error:")
-    print(met.metrics_report())
+    # Device-specific diagnostics
+    if device_type == "tpu" and TPU_AVAILABLE:
+        logger.info("\nTPU diagnostic information at error:")
+        logger.info(met.metrics_report())
+    elif device_type == "gpu" and torch.cuda.is_available():
+        logger.info("\nGPU diagnostic information at error:")
+        for i in range(torch.cuda.device_count()):
+            logger.info(f"GPU {i} memory: {torch.cuda.memory_allocated(i) / 1024 / 1024:.2f} MB allocated")
     
     # Try to save checkpoint if possible
     try:
-        print("\nAttempting to save checkpoint after error...")
-        if xm.is_master_ordinal():
-            trainer.save_model("./phi3_tpu_swift_model_checkpoint_after_error")
-            print("Emergency checkpoint saved to ./phi3_tpu_swift_model_checkpoint_after_error")
-    except:
-        print("Could not save emergency checkpoint")
+        logger.info("\nAttempting to save emergency checkpoint...")
+        emergency_path = f"./phi3_{device_type}_swift_model_emergency_checkpoint"
+        
+        if device_type == "tpu" and TPU_AVAILABLE:
+            if xm.is_master_ordinal():
+                trainer.save_model(emergency_path)
+        else:
+            trainer.save_model(emergency_path)
+            
+        logger.info(f"Emergency checkpoint saved to {emergency_path}")
+    except Exception as save_error:
+        logger.error(f"Could not save emergency checkpoint: {save_error}")
     
     # Monitor resources after error
-    print("Resources after error:")
-    monitor_tpu_resources()
+    logger.info("Resources after error:")
+    monitor_training_resources()
     
     raise
 
 # %%
-# Test the model with Swift code examples (TPU-specific)
+# Test the model with Swift code examples (device-agnostic approach)
 try:
-    print("Testing the model with Swift code examples on TPU...")
+    logger.info(f"Testing the model with Swift code examples on {device_type.upper()}...")
     
-    # Function to generate responses for test examples on TPU
-    def generate_response(prompt):
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        
-        # Use TPU-specific generation
-        with torch.no_grad():
-            # Move inputs to TPU
-            input_ids = inputs.input_ids
+    # Function to generate responses for test examples with device-specific handling
+    def generate_response(prompt, max_length=200):
+        """Generate model response with appropriate device handling"""
+        try:
+            # Tokenize the input
+            inputs = tokenizer(prompt, return_tensors="pt")
             
-            # Generate with TPU-aware operations
-            outputs = model.generate(
-                input_ids,
-                max_new_tokens=200,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id
-            )
+            # Move inputs to the appropriate device
+            for key in inputs:
+                inputs[key] = inputs[key].to(device)
             
-            # Ensure TPU operations complete
-            xm.mark_step()
+            # Set generation parameters
+            generation_config = {
+                "max_new_tokens": max_length,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "do_sample": True,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
             
-        # Return to host for decoding
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract just the assistant's response
-        if "<|assistant|>" in response:
-            response = response.split("<|assistant|>")[-1].strip()
-        return response
+            # Device-specific handling for generation
+            with torch.no_grad():
+                # Generate with proper device handling
+                if device_type == "tpu" and TPU_AVAILABLE:
+                    # TPU-specific generation
+                    outputs = model.generate(**inputs, **generation_config)
+                    # Ensure TPU operations complete
+                    xm.mark_step()
+                else:
+                    # GPU/CPU generation
+                    outputs = model.generate(**inputs, **generation_config)
+                
+            # Return to host for decoding
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extract just the assistant's response
+            if "<|assistant|>" in response:
+                response = response.split("<|assistant|>")[-1].strip()
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            logger.error(traceback.format_exc())
+            return f"Error: Could not generate response due to: {str(e)}"
     
     # Test prompts for different Swift language tasks
     test_prompts = [
@@ -1022,15 +1537,49 @@ try:
         "<|user|>\nExplain Swift best practices for error handling:\n<|assistant|>"
     ]
     
-    # Generate and print responses
+    # Generate and print responses with proper error handling
     for i, prompt in enumerate(test_prompts):
-        print(f"\nTest {i+1}:\n{'-'*40}")
-        print(f"Prompt: {prompt.split('<|assistant|>')[0].replace('<|user|>', '')}")
-        response = generate_response(prompt)
-        print(f"\nResponse:\n{response}\n")
+        try:
+            logger.info(f"\nTest {i+1}:\n{'-'*40}")
+            
+            # Extract user part of prompt for logging
+            user_prompt = prompt.split('<|assistant|>')[0].replace('<|user|>', '')
+            logger.info(f"Prompt: {user_prompt}")
+            
+            # Generate response with device-appropriate handling
+            logger.info(f"Generating response on {device_type}...")
+            response = generate_response(prompt)
+            
+            # Log and display the response
+            logger.info(f"\nResponse:\n{response}\n")
+            
+            # Clean up after each test
+            cleanup_memory()
+            
+        except Exception as test_error:
+            logger.error(f"Error in test {i+1}: {test_error}")
     
-    print("\nTPU testing complete")
+    logger.info(f"\n{device_type.upper()} testing complete")
+    
+    # Save example responses
+    example_output_path = f"./phi3_{device_type}_swift_examples.txt"
+    try:
+        with open(example_output_path, "w") as f:
+            f.write(f"Example outputs from Phi-3 fine-tuned on Swift ({device_type}):\n\n")
+            
+            for i, prompt in enumerate(test_prompts):
+                user_prompt = prompt.split('<|assistant|>')[0].replace('<|user|>', '')
+                response = generate_response(prompt, max_length=100)  # Shorter for examples
+                
+                f.write(f"Example {i+1}:\n")
+                f.write(f"Prompt: {user_prompt}\n")
+                f.write(f"Response: {response}\n\n")
+                f.write("-" * 80 + "\n\n")
+                
+        logger.info(f"Saved example outputs to {example_output_path}")
+    except Exception as save_error:
+        logger.error(f"Error saving example outputs: {save_error}")
+    
 except Exception as e:
-    print(f"Error during TPU testing: {e}")
-    import traceback
-    traceback.print_exc()
+    logger.error(f"Error during {device_type} testing: {e}")
+    logger.error(traceback.format_exc())
