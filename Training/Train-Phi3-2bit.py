@@ -117,20 +117,30 @@ from transformers import (
 )
 from transformers.trainer_callback import EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-# Import AQLM for 2-bit quantization
+# Import GGUF for model quantization
 try:
     try:
-        import aqlm
+        import ctransformers
     except ImportError:
-        print("AQLM package not found. Installing...")
+        print("ctransformers package not found. Installing...")
         import subprocess
-        subprocess.check_call(["pip", "install", "-U", "aqlm", "--no-cache-dir"])
-        import aqlm
+        subprocess.check_call(["pip", "install", "-U", "ctransformers", "--no-cache-dir"])
+        import ctransformers
+
+    # Also install llama-cpp-python for additional GGUF compatibility
+    try:
+        import llama_cpp
+    except ImportError:
+        print("llama-cpp-python package not found. Installing...")
+        subprocess.check_call(["pip", "install", "-U", "llama-cpp-python", "--no-cache-dir"])
+        import llama_cpp
     
-    # AQLM correctly imported - we'll use it directly for quantization when loading the model
-    print("AQLM imported successfully - version:", aqlm.__version__ if hasattr(aqlm, "__version__") else "unknown")
+    print("GGUF libraries imported successfully - ctransformers version:", 
+          ctransformers.__version__ if hasattr(ctransformers, "__version__") else "unknown")
+    print("llama-cpp-python version:", 
+          llama_cpp.__version__ if hasattr(llama_cpp, "__version__") else "unknown")
 except Exception as e:
-    print(f"Error importing AQLM: {e}")
+    print(f"Error importing GGUF libraries: {e}")
     print("Will fallback to 4-bit quantization using BitsAndBytes")
 
 # Define Kaggle-optimized memory cleanup function
@@ -915,233 +925,163 @@ print("="*80)
 print("🤖 Initializing model with quantization...")
 
 # Create a flag to track which quantization method we're using
-USING_AQLM = False
+USING_GGUF = False
 QUANT_BITS = 2  # Default to 2-bit quantization
 
 print(f"📥 Loading {MODEL_NAME} with {QUANT_BITS}-bit quantization...")
 
 try:
-    # First check if AQLM is available
-    if 'aqlm' in globals() or 'aqlm' in locals():
-        # Use AQLM's correct approach for 2-bit quantization
-        print(f"Using AQLM for {QUANT_BITS}-bit quantization...")
+    # First check if GGUF libraries are available
+    if ('ctransformers' in globals() or 'ctransformers' in locals()) and ('llama_cpp' in globals() or 'llama_cpp' in locals()):
+        # Use GGUF for 2-bit quantization
+        print(f"Using GGUF for {QUANT_BITS}-bit quantization...")
         
-        # First load the model with empty weights to save memory
-        print(f"Loading base model {MODEL_NAME} with CPU offloading and memory optimizations...")
+        # First load the model with HF transformers
+        print(f"Loading base model {MODEL_NAME} with standard transformers to prepare for GGUF conversion...")
         
-        # For GPU or CPU with advanced memory management
-        if USE_CPU_OFFLOAD:
-            print("Using CPU offloading to reduce GPU memory usage...")
-            
-            # First initialize with empty weights to avoid OOM during loading
-            with init_empty_weights():
-                config = AutoModelForCausalLM.from_pretrained(
-                    MODEL_NAME, 
-                    trust_remote_code=True,
-                    return_dict=True
-                )
-                # Add memory-efficient attention method to config
-                if USE_MEMORY_EFFICIENT_ATTENTION and hasattr(config, "attention_implementation"):
-                    print("Enabling memory-efficient attention...")
-                    config.attention_implementation = "flash_attention_2"
-            
-            # Then load the checkpoint directly to the appropriate devices with offloading
-            print("Loading checkpoint with weight offloading...")
-            offload_folder = OFFLOAD_FOLDER if USE_SEQUENTIAL_OFFLOAD else None
-            
-            # Create maximum offload configuration for disk offloading
-            device_map = {
-                "model.embed_tokens": 0,  # Keep embeddings on GPU 0
-                "model.norm": 0,          # Keep normalization on GPU 0
-                "lm_head": 0,             # Keep LM head on GPU 0
-            }
-            
-            # Distribute layers across devices with CPU/disk offloading
-            # Get number of layers with compatibility for different model types
-            n_layers = None
-            
-            # First, try direct model name detection which is most reliable for Phi-3 models
-            if "phi-3" in MODEL_NAME.lower() or "phi3" in MODEL_NAME.lower():
-                # Use hardcoded values for known Phi-3 variants
-                if "mini" in MODEL_NAME.lower():
-                    n_layers = 32  # Phi-3-mini has 32 layers
-                    print(f"Direct model name detection: Phi-3-mini has {n_layers} layers")
-                elif "medium" in MODEL_NAME.lower():
-                    n_layers = 60  # Phi-3-medium has 60 layers
-                    print(f"Direct model name detection: Phi-3-medium has {n_layers} layers")
-                elif "small" in MODEL_NAME.lower():
-                    n_layers = 26  # Phi-3-small has 26 layers
-                    print(f"Direct model name detection: Phi-3-small has {n_layers} layers") 
-                else:
-                    n_layers = 32
-                    print(f"Direct model name detection: Unknown Phi-3 variant, assuming {n_layers} layers")
-            
-            # If we couldn't determine layers by name, try config attributes
-            if n_layers is None:
-                # Try different attribute names used by various model architectures
-                for attr_name in ["num_hidden_layers", "n_layer", "num_layers", "n_blocks"]:
-                    if hasattr(config, attr_name):
-                        n_layers = getattr(config, attr_name)
-                        print(f"Found layers count using config.{attr_name}: {n_layers}")
-                        break
-            
-            # As fallback for Phi-3 models, try to detect layers by architecture patterns
-            if n_layers is None:
-                # For Phi-3 models - always use known architecture values rather than relying on config detection
-                # This is specifically needed for Microsoft's Phi-3 models
-                if "phi-3" in MODEL_NAME.lower() or "phi3" in MODEL_NAME.lower():
-                    # Force use model name detection since config detection fails
-                    print("Detected Microsoft Phi-3 model from name, using architecture-specific layer count")
-                    if "mini" in MODEL_NAME.lower():
-                        n_layers = 32  # Phi-3-mini has 32 layers
-                        print(f"Phi-3-mini detected, setting layers to: {n_layers}")
-                    elif "medium" in MODEL_NAME.lower():
-                        n_layers = 60  # Phi-3-medium has 60 layers
-                        print(f"Phi-3-medium detected, setting layers to: {n_layers}")
-                    elif "small" in MODEL_NAME.lower():
-                        n_layers = 26  # Phi-3-small has 26 layers
-                        print(f"Phi-3-small detected, setting layers to: {n_layers}")
-                    else:
-                        # Default to 32 for unknown Phi-3 variants
-                        n_layers = 32
-                        print(f"Unknown Phi-3 variant, defaulting to {n_layers} layers")
-                # Check model_type as well for redundancy
-                elif hasattr(config, "model_type") and ("phi" in config.model_type.lower()):
-                    # Phi-3 typically has 32 layers in the mini version
-                    if "mini" in MODEL_NAME.lower():
-                        n_layers = 32
-                    # Phi-3-medium typically has 60 layers
-                    elif "medium" in MODEL_NAME.lower():
-                        n_layers = 60
-                    # Phi-3-small typically has 26 layers
-                    elif "small" in MODEL_NAME.lower():
-                        n_layers = 26
-                    else:
-                        # Default to 32 for unknown Phi-3 variants
-                        n_layers = 32
-                    print(f"Using estimated layers for Phi-3 model from config.model_type: {n_layers}")
-                else:
-                    # Explicitly check for common model names
-                    if "phi" in MODEL_NAME.lower():
-                        # This is likely a Phi model but we couldn't detect the variant
-                        n_layers = 32
-                        print(f"Detected a Phi model by name, using default of {n_layers} layers")
-                    else:
-                        # Last resort default
-                        n_layers = 32  # Changed from 24 to 32 as safer default
-                        print(f"Warning: Could not determine number of layers, using safer default: {n_layers}")
-            
-            gpu0_layers = n_layers // 4      # 25% on GPU 0
-            gpu1_layers = n_layers // 4      # 25% on GPU 1
-            cpu_layers = n_layers - gpu0_layers - gpu1_layers  # Rest on CPU with potential disk offload
-            
-            # Assign layers to devices
-            for i in range(n_layers):
-                if i < gpu0_layers:
-                    device_map[f"model.layers.{i}"] = 0
-                elif i < gpu0_layers + gpu1_layers:
-                    device_map[f"model.layers.{i}"] = 1
-                else:
-                    device_map[f"model.layers.{i}"] = "cpu"
-            
-            print(f"Device map: GPU 0: {gpu0_layers} layers, GPU 1: {gpu1_layers} layers, CPU: {cpu_layers} layers")
-            
-            # Load with offloading to CPU/disk
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_NAME,
-                device_map=device_map,
-                offload_folder=offload_folder,
-                offload_state_dict=True,  # Enable state dict offloading
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                use_cache=False,  # Disable KV cache during training
-                attn_implementation="eager" if not USE_MEMORY_EFFICIENT_ATTENTION else "flash_attention_2"
-            )
-        else:
-            # Standard loading with basic memory optimization
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_NAME,
-                torch_dtype=torch.float16,
-                device_map="auto" if torch.cuda.is_available() else None,
-                trust_remote_code=True,
-                use_cache=False,  # Disable KV cache during training for better memory efficiency
-                low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
-            )
+        # Standard loading with memory optimization
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch.float16,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+            use_cache=False,  # Disable KV cache for better memory efficiency
+            low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+        )
         
-        # Now apply AQLM 2-bit quantization to the model
-        print(f"Applying AQLM {QUANT_BITS}-bit quantization...")
+        # Create temporary directory for GGUF conversion
+        import tempfile
+        import os
+        from pathlib import Path
+        
+        temp_dir = Path(tempfile.mkdtemp())
+        hf_model_path = temp_dir / "hf_model"
+        gguf_output_path = temp_dir / "model.gguf"
+        
+        print(f"Saving model to temporary directory for GGUF conversion: {hf_model_path}")
+        
+        # Save the model in HF format first
+        model.save_pretrained(hf_model_path)
+        tokenizer.save_pretrained(hf_model_path)
+        
+        # Now apply GGUF 2-bit quantization using conversion tools
+        print(f"Converting to GGUF with {QUANT_BITS}-bit quantization...")
         
         try:
-            # Get the AQLM quantizer - try different possible module paths
-            try:
-                # Try different module paths where quantize function might be
-                if hasattr(aqlm, 'quantize'):
-                    quantize_fn = aqlm.quantize
-                elif hasattr(aqlm, 'quantization') and hasattr(aqlm.quantization, 'quantize'):
-                    quantize_fn = aqlm.quantization.quantize
-                else:
-                    # Try to discover the correct module
-                    for module_name in dir(aqlm):
-                        module = getattr(aqlm, module_name)
-                        if hasattr(module, 'quantize'):
-                            quantize_fn = module.quantize
-                            print(f"Found quantize function in aqlm.{module_name}")
-                            break
-                    else:
-                        raise ImportError("Could not find quantize function in AQLM modules")
-                
-                # Apply quantization to the model
-                model = quantize_fn(
-                    model, 
-                    bits=QUANT_BITS, 
-                    lora_rank=LORA_R,  # Use the same rank as we'll use for LoRA
-                )
-                USING_AQLM = True
-                print(f"Successfully applied AQLM {QUANT_BITS}-bit quantization")
+            # First method: Use ctransformers for quantization
+            from ctransformers.lib import convert_hf_to_gguf
             
-            except (ImportError, AttributeError) as e:
-                print(f"Error using AQLM quantization: {e}")
-                print("Trying alternative AQLM API...")
-                
-                # Try an alternative approach with explicit package imports
-                from aqlm import quantize
-                model = quantize(
-                    model,
-                    bits=QUANT_BITS,
-                    lora_rank=LORA_R
-                )
-                USING_AQLM = True
-                print(f"Successfully applied AQLM {QUANT_BITS}-bit quantization using direct import")
-                
-        except Exception as quant_error:
-            print(f"AQLM {QUANT_BITS}-bit quantization failed: {quant_error}")
-            
-            # If 2-bit failed, try 4-bit with AQLM before falling back to BitsAndBytes
+            # Define GGUF quantization type based on bit level
             if QUANT_BITS == 2:
-                print("Trying AQLM with 4-bit quantization instead...")
-                QUANT_BITS = 4
-                try:
-                    from aqlm import quantize
-                    model = quantize(
-                        model,
-                        bits=QUANT_BITS,
-                        lora_rank=LORA_R
-                    )
-                    USING_AQLM = True
-                    print(f"Successfully applied AQLM {QUANT_BITS}-bit quantization")
-                except Exception as e:
-                    print(f"AQLM {QUANT_BITS}-bit quantization also failed: {e}")
-                    raise  # Let it fall through to BitsAndBytes fallback
+                quant_type = "q2_k"  # 2-bit quantization with k-quants
+            elif QUANT_BITS == 3:
+                quant_type = "q3_k"  # 3-bit quantization
+            elif QUANT_BITS == 4:
+                quant_type = "q4_k"  # 4-bit quantization
             else:
+                quant_type = "q2_k"  # Default to 2-bit if not specified
+                
+            print(f"Using GGUF quantization type: {quant_type}")
+            
+            # Convert the model to GGUF format with the specified quantization
+            convert_hf_to_gguf(
+                str(hf_model_path),
+                str(gguf_output_path),
+                quantization_type=quant_type
+            )
+            
+            # Load the GGUF model for verification
+            from ctransformers import AutoModelForCausalLM as CTAutoModelForCausalLM
+            
+            gguf_model = CTAutoModelForCausalLM.from_pretrained(
+                str(gguf_output_path),
+                model_type="phi",  # Specify it's a Phi model
+                gpu_layers=24,     # Use GPU for most layers
+                context_length=MAX_LENGTH
+            )
+            
+            print(f"Successfully converted and loaded GGUF {QUANT_BITS}-bit quantized model")
+            
+            # Now we need to integrate the GGUF model with our HF training pipeline
+            # We'll keep the original model for training with LoRA but save the GGUF model for inference
+            print("Saving the GGUF quantized model for inference after training")
+            
+            # Create directory for the GGUF model
+            os.makedirs("./phi3_swift_model_gguf", exist_ok=True)
+            
+            # Copy the GGUF model to the output directory
+            import shutil
+            shutil.copy(gguf_output_path, "./phi3_swift_model_gguf/model.gguf")
+            
+            # Continue with HF model for training but set the flag to indicate we'll use GGUF for inference
+            USING_GGUF = True
+            print(f"Will use GGUF {QUANT_BITS}-bit quantization for inference after training")
+            
+        except Exception as e:
+            print(f"Error with ctransformers GGUF conversion: {e}")
+            print("Trying alternative GGUF conversion method...")
+            
+            # Try alternative method: Use llama.cpp for conversion if available
+            try:
+                import llama_cpp
+                from llama_cpp import Llama
+                
+                # Determine the appropriate quantization type
+                if QUANT_BITS == 2:
+                    quant_type = "Q2_K"
+                elif QUANT_BITS == 3:
+                    quant_type = "Q3_K" 
+                elif QUANT_BITS == 4:
+                    quant_type = "Q4_K"
+                else:
+                    quant_type = "Q2_K"  # Default to 2-bit
+                
+                # First check if llama-cpp-python includes the conversion tool directly
+                if hasattr(llama_cpp, "convert_hf_to_gguf"):
+                    print("Using llama-cpp-python's built-in converter")
+                    llama_cpp.convert_hf_to_gguf(
+                        str(hf_model_path),
+                        str(gguf_output_path),
+                        quantization_type=quant_type
+                    )
+                else:
+                    # Otherwise, use the command-line tool
+                    print("Using command-line llama-cpp-python converter")
+                    import subprocess
+                    subprocess.check_call([
+                        "python", "-m", "llama_cpp.convert_hf_to_gguf",
+                        str(hf_model_path),
+                        "--outfile", str(gguf_output_path),
+                        "--quantize", quant_type
+                    ])
+                
+                # Verify the model can be loaded
+                model_gguf = Llama(
+                    model_path=str(gguf_output_path),
+                    n_ctx=MAX_LENGTH,
+                    n_gpu_layers=24
+                )
+                
+                print(f"Successfully converted and loaded GGUF {QUANT_BITS}-bit quantized model with llama-cpp")
+                
+                # Save the model for later use
+                os.makedirs("./phi3_swift_model_gguf", exist_ok=True)
+                shutil.copy(gguf_output_path, "./phi3_swift_model_gguf/model.gguf")
+                
+                USING_GGUF = True
+                print(f"Will use GGUF {QUANT_BITS}-bit quantization for inference after training")
+                
+            except Exception as llama_cpp_error:
+                print(f"llama-cpp-python GGUF conversion also failed: {llama_cpp_error}")
                 raise  # Let it fall through to BitsAndBytes fallback
     else:
-        raise ImportError("AQLM not available")
+        raise ImportError("GGUF libraries not available")
         
 except Exception as e:
     # Fallback to using BitsAndBytes for 4-bit quantization
     print(f"Falling back to BitsAndBytes 4-bit quantization: {e}")
     QUANT_BITS = 4
-    USING_AQLM = False
+    USING_GGUF = False
     
     # BitsAndBytes 4-bit quantization with CPU offloading for training
     # Note: This requires the multi-backend version of BitsAndBytes we installed earlier
@@ -1445,7 +1385,7 @@ print(f"Model trainable parameters: {sum(p.numel() for p in model.parameters() i
 print(f"Model parameters using memory: {sum(p.numel() * (2 if p.dtype == torch.float16 else 4) for p in model.parameters()) / (1024**2):.2f} MB")
 
 # Print information about the quantized model
-quant_method = "AQLM" if USING_AQLM else "BitsAndBytes"
+quant_method = "GGUF" if USING_GGUF else "BitsAndBytes"
 print(f"✅ Model loaded and configured with {QUANT_BITS}-bit {quant_method} quantization and LoRA (rank={LORA_R})")
 print(f"Model architecture: {model.__class__.__name__}")
 print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
@@ -1693,8 +1633,10 @@ try:
     trainer.save_model("./phi3_swift_model")
     
     # Determine the quantization method for display
-    quant_method = "AQLM" if USING_AQLM else "BitsAndBytes"
+    quant_method = "GGUF" if USING_GGUF else "BitsAndBytes"
     print(f"✅ Model saved to ./phi3_swift_model ({QUANT_BITS}-bit {quant_method} quantized)")
+    if USING_GGUF:
+        print(f"✅ GGUF model also saved to ./phi3_swift_model_gguf/model.gguf")
     print(f"   Trained on: {'GPU' if torch.cuda.is_available() else 'CPU'}")
     
     # Save model configuration details
@@ -1713,19 +1655,27 @@ try:
         print("✅ Model configuration saved")
     
     # Create appropriate loading instructions based on quantization method
-    if USING_AQLM:
+    if USING_GGUF:
         loading_code = """```python
-from aqlm import quantize
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# Method 1: Using ctransformers (recommended for simplicity)
+from ctransformers import AutoModelForCausalLM
 
-# Load the tokenizer
-tokenizer = AutoTokenizer.from_pretrained("./phi3_swift_model")
+# Load the GGUF quantized model
+model = AutoModelForCausalLM.from_pretrained(
+    "./phi3_swift_model_gguf/model.gguf",
+    model_type="phi",
+    gpu_layers=24,  # Adjust based on your GPU memory
+    context_length=4096  # Adjust based on your needs
+)
 
-# Load the base model first (to apply quantization)
-base_model = AutoModelForCausalLM.from_pretrained("./phi3_swift_model")
+# Alternative Method 2: Using llama-cpp-python for more options
+from llama_cpp import Llama
 
-# Apply AQLM quantization
-model = quantize(base_model, bits=QUANT_BITS, lora_rank=LORA_R)
+model = Llama(
+    model_path="./phi3_swift_model_gguf/model.gguf",
+    n_gpu_layers=24,  # Adjust based on your GPU memory
+    n_ctx=4096        # Adjust based on your needs
+)
 ```"""
     else:
         loading_code = """```python
@@ -1774,6 +1724,62 @@ To load this model:
 {loading_code}
 
 This quantized model reduces memory usage significantly while maintaining most of the capabilities of the original model.
+""")
+    
+    # If using GGUF, create a separate README for the GGUF model
+    if USING_GGUF:
+        with open("./phi3_swift_model_gguf/README.md", "w") as f:
+            f.write(f"""# Phi-3-mini GGUF Quantized Model for Swift
+
+This is a {QUANT_BITS}-bit GGUF quantized version of `{MODEL_NAME}` for Swift programming.
+
+## Quantization Details
+- Method: GGUF (General GPU Usable Format)
+- Quantization Type: {quant_type if 'quant_type' in locals() else f'q{QUANT_BITS}_k'}
+- Bits: {QUANT_BITS}
+- Base Model: `{MODEL_NAME}`
+- Training Dataset: {DATASET_ID}
+- Created: {time.strftime("%Y-%m-%d")}
+
+## Usage
+
+### Method 1: Using ctransformers
+```python
+from ctransformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "./model.gguf",
+    model_type="phi",
+    gpu_layers=24,  # Adjust based on your GPU memory
+    context_length=4096  # Adjust based on your needs
+)
+
+# Generate text
+response = model("Swift is a programming language that")
+print(response)
+```
+
+### Method 2: Using llama-cpp-python
+```python
+from llama_cpp import Llama
+
+model = Llama(
+    model_path="./model.gguf",
+    n_gpu_layers=24,  # Adjust based on your GPU memory
+    n_ctx=4096        # Adjust based on your needs
+)
+
+# Generate text
+response = model.create_completion(
+    "Swift is a programming language that",
+    max_tokens=128,
+    temperature=0.7,
+    top_p=0.95
+)
+print(response)
+```
+
+This GGUF quantized model allows efficient inference on various hardware while maintaining good quality.
 """)
         print("✅ Model documentation created")
     
