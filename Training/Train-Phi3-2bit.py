@@ -186,7 +186,7 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 
 # Debug mode for testing with smaller dataset
-DEBUG_MODE = False
+DEBUG_MODE = True
 DEBUG_SAMPLE_SIZE = 100
 
 print(f"Using model: {MODEL_NAME}")
