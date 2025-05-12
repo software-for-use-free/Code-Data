@@ -1,9 +1,11 @@
-name: Convert Python Script to Jupyter Notebook
+name: Convert Python Scripts to Jupyter Notebooks
 
 on:
-  workflow_dispatch:
+  push:
     paths:
+      - 'Training/Train-Phi3-2bit.py'
       - 'Training/Train-Phi3-4bit.py'
+  workflow_dispatch:
 
 jobs:
   convert-to-notebook:
@@ -26,18 +28,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install jupytext
 
-      # Convert Python script to Jupyter notebook
-      - name: Convert script to notebook
+      # Ensure Notebooks directory exists
+      - name: Create Notebooks directory
         run: |
-          jupytext --to notebook Training/Train-Phi3-4bit.py -o Training/Train-Phi3-4bit.ipynb
+          mkdir -p Notebooks
 
-      # Commit and push the notebook if changes exist
-      - name: Commit notebook
+      # Convert Python scripts to Jupyter notebooks
+      - name: Convert scripts to notebooks
+        run: |
+          if [ -f Training/Train-Phi3-2bit.py ]; then
+            jupytext --to notebook Training/Train-Phi3-2bit.py -o Notebooks/Train-Phi3-2bit.ipynb
+          fi
+          if [ -f Training/Train-Phi3-4bit.py ]; then
+            jupytext --to notebook Training/Train-Phi3-4bit.py -o Notebooks/Train-Phi3-4bit.ipynb
+          fi
+
+      # Commit and push the notebooks if changes exist
+      - name: Commit notebooks
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add Training/Train-Phi3-4bit.ipynb
-          git diff --staged --quiet || git commit -m "Convert Train-Phi3-4bit.py to Jupyter notebook"
+          git add Notebooks/Train-Phi3-2bit.ipynb Notebooks/Train-Phi3-4bit.ipynb
+          git diff --staged --quiet || git commit -m "Convert Train-Phi3-2bit.py and Train-Phi3-4bit.py to Jupyter notebooks in Notebooks folder"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
