@@ -1169,10 +1169,14 @@ except Exception as e:
             trust_remote_code=True,
             return_dict=True
         )
-        # Add memory-efficient attention method to config if available
-        if USE_MEMORY_EFFICIENT_ATTENTION and hasattr(config, "attention_implementation"):
-            print("Enabling memory-efficient attention...")
-            config.attention_implementation = "flash_attention_2"
+        # Disable memory-efficient attention to avoid torchvision dependency
+        if hasattr(config, "attention_implementation"):
+            print("Setting standard attention implementation to avoid torchvision dependency...")
+            config.attention_implementation = "eager_attention"
+        # Ensure no vision-related components are loaded
+        if hasattr(config, "vision_config"):
+            print("Disabling vision config to avoid torchvision dependency...")
+            config.vision_config = None
     
     # Create hybrid device map that allows CPU offloading with multi-backend BitsAndBytes
     offload_folder = OFFLOAD_FOLDER if USE_SEQUENTIAL_OFFLOAD else None
@@ -1373,6 +1377,10 @@ except Exception as e:
                 "cpu": "24GB",     # Limited CPU memory for Kaggle
             }
             
+            # Disable torch._C._jit_override_can_fuse_on_cpu to avoid torchvision dependency
+            if hasattr(torch._C, "_jit_override_can_fuse_on_cpu"):
+                torch._C._jit_override_can_fuse_on_cpu = False
+                
             model = AutoModelForCausalLM.from_pretrained(
                 MODEL_NAME,
                 quantization_config=simple_bnb_config,
@@ -1381,17 +1389,23 @@ except Exception as e:
                 low_cpu_mem_usage=True,  # More aggressive CPU memory optimization
                 torch_dtype=torch.float16,
                 trust_remote_code=True,
-                use_cache=False
+                use_cache=False,
+                attn_implementation="eager"  # Use eager implementation to avoid torchvision dependency
             )
     else:
         # Standard loading with basic memory optimization
+        # Disable torch._C._jit_override_can_fuse_on_cpu to avoid torchvision dependency
+        if hasattr(torch._C, "_jit_override_can_fuse_on_cpu"):
+            torch._C._jit_override_can_fuse_on_cpu = False
+            
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             quantization_config=bnb_config,
             device_map="auto" if torch.cuda.is_available() else None,
             torch_dtype=torch.float16,
             trust_remote_code=True,
-            use_cache=False
+            use_cache=False,
+            attn_implementation="eager"  # Use eager implementation to avoid torchvision dependency
         )
     print("Successfully loaded model with BitsAndBytes 4-bit quantization")
 
