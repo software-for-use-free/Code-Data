@@ -12,6 +12,13 @@
 #     name: python3
 # ---
 
+# Prevent torchvision from being imported (must be at the very top, before any imports)
+import os
+os.environ["TRANSFORMERS_SKIP_TORCH_VISION_IMPORT"] = "1"
+os.environ["PYTORCH_JIT"] = "0"  # Disable JIT which might try to use torchvision ops
+os.environ["TRANSFORMERS_OFFLINE"] = "1"  # Temporarily set offline mode
+os.environ["DISABLE_TORCH_VISION_MODELS"] = "1"  # Custom env var to signal we don't want vision models
+
 # %% [markdown]
 # # Training Phi-3-mini-128k-instruct to Learn Swift Programming Language
 #
@@ -141,33 +148,34 @@ import random
 import time
 import collections
 import psutil
-import os
 import gc
 import sys
 import json
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-from datasets import load_dataset
 
-# Set environment variables to disable unnecessary features
+# Further reinforce skipping torchvision imports
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["BITSANDBYTES_NOWELCOME"] = "1"
+# Block any potential torchvision imports by filtering module imports
+sys.modules['torchvision'] = None
 
-# Skip unnecessary imports in transformers
-os.environ["TRANSFORMERS_OFFLINE"] = "1"  # Temporarily set offline mode
-os.environ["TRANSFORMERS_SKIP_TORCH_VISION_IMPORT"] = "1"  # Skip image-related components
+# Import non-vision datasets
+from datasets import load_dataset
 
-# Import transformers components individually to avoid problematic dependencies
+# Import accelerate library for memory optimization (no vision components)
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+
+# Only import specific transformers components we need to avoid pulling in vision components
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.training_args import TrainingArguments
 from transformers.trainer import Trainer
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.utils.quantization_config import BitsAndBytesConfig
-
-# Reset offline mode after imports
-os.environ.pop("TRANSFORMERS_OFFLINE", None)
-
 from transformers.trainer_callback import EarlyStoppingCallback
+
+# Import from peft for fine-tuning
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 # Import GGUF for model quantization
 try:
@@ -1464,9 +1472,6 @@ print("🔧 Creating trainer and configuring training parameters...")
 
 # Create trainer with memory optimizations for GPU/CPU
 print("Setting up memory-optimized trainer...")
-
-# Ensure environment variables are set for transformers
-os.environ["TRANSFORMERS_SKIP_TORCH_VISION_IMPORT"] = "1"
 
 # Add additional memory optimization callbacks
 from transformers.trainer_callback import TrainerCallback
