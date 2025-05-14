@@ -38,7 +38,7 @@ def parse_arguments():
     parser.add_argument(
         "--finetuned_model", 
         type=str,
-        default="", # Leave empty for user to fill in
+        default="Backup-bdg/Phi3-Swift-4bit", # Leave empty for user to fill in
         help="HuggingFace model ID of the fine-tuned model (e.g., 'yourusername/phi3-swift-finetuned')"
     )
     parser.add_argument(
@@ -58,7 +58,7 @@ def parse_arguments():
     parser.add_argument(
         "--max_test_samples", 
         type=int,
-        default=100,
+        default=10,
         help="Maximum number of test samples to evaluate"
     )
     parser.add_argument(
