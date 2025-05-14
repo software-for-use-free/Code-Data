@@ -189,6 +189,13 @@ def prepare_swift_benchmark():
 def generate_response(model, tokenizer, prompt, max_tokens=200, device="cuda"):
     """Generate a response from the model."""
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    
+    # Add a monkey patch for the DynamicCache class to handle API change
+    # The error occurs because get_max_length() was renamed to get_seq_length()
+    from transformers.cache_utils import DynamicCache
+    if not hasattr(DynamicCache, "get_max_length") and hasattr(DynamicCache, "get_seq_length"):
+        DynamicCache.get_max_length = DynamicCache.get_seq_length
+    
     with torch.no_grad():
         outputs = model.generate(
             inputs.input_ids,
