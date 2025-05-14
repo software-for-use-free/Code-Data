@@ -60,7 +60,7 @@ from transformers import (
     BitsAndBytesConfig
 )
 from transformers.trainer_callback import EarlyStoppingCallback
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import prepare_model_for_kbit_training
 
 # Define Kaggle-optimized memory cleanup function
 def cleanup_memory():
@@ -180,11 +180,6 @@ NUM_EPOCHS = 3
 WARMUP_RATIO = 0.03
 GRADIENT_ACCUMULATION_STEPS = 8  # Increased to compensate for smaller batch size
 
-# LoRA configuration
-LORA_R = 16
-LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
-
 # Debug mode for testing with smaller dataset
 DEBUG_MODE = True
 DEBUG_SAMPLE_SIZE = 100
@@ -193,7 +188,7 @@ print(f"Using model: {MODEL_NAME}")
 print(f"Max sequence length: {MAX_LENGTH}")
 print(f"Batch size: {BATCH_SIZE} per device")
 print(f"Effective batch size: {BATCH_SIZE * (2 if torch.cuda.device_count() > 1 else 1) * GRADIENT_ACCUMULATION_STEPS}")
-print(f"LoRA rank: {LORA_R}")
+print(f"Training mode: Full model fine-tuning")
 
 
 # %%
@@ -857,25 +852,22 @@ try:
     
     print(f"Successfully loaded model with 4-bit quantization")
     
-    # Configure LoRA for efficient fine-tuning
-    print("Setting up LoRA fine-tuning...")
-    
-    lora_config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="CAUSAL_LM",
-        # Target only essential modules to save memory
-        target_modules=["q_proj", "v_proj", "o_proj", "gate_proj"],
-        modules_to_save=None,  # Don't save any modules fully to save memory
-    )
+    # Configure the model for full-weight fine-tuning instead of LoRA
+    print("Setting up full model fine-tuning...")
     
     # Prepare the model for training - crucial for memory efficiency
     try:
-        print("Preparing model for k-bit training with multi-backend support...")
+        print("Preparing model for full fine-tuning with multi-backend support...")
+        
+        # Use prepare_model_for_kbit_training to enable gradient computation
         model = prepare_model_for_kbit_training(model)
-        print("Model successfully prepared for k-bit training")
+        
+        # Make all parameters trainable for full fine-tuning
+        for param_name, param in model.named_parameters():
+            param.requires_grad = True
+            
+        print("Model successfully prepared for full fine-tuning")
+        
     except ValueError as e:
         if "You can't train a model that has been loaded in 8-bit or 4-bit precision with CPU or disk offload" in str(e):
             print("Error with k-bit training preparation. Falling back to full precision for CPU offloaded layers...")
@@ -913,12 +905,9 @@ try:
                 print("Please consider reducing model size or using a machine with more GPU memory")
         else:
             raise e
-            
-    # Apply LoRA adapter
-    model = get_peft_model(model, lora_config)
     
     # Print information about the quantized model
-    print(f"Model loaded and configured with 4-bit quantization and LoRA (rank={LORA_R})")
+    print(f"Model loaded and configured with 4-bit quantization for full fine-tuning")
     print(f"Model architecture: {model.__class__.__name__}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
@@ -1154,9 +1143,12 @@ try:
                 low_cpu_mem_usage=True
             )
             
-            # Prepare model for training
+            # Prepare model for full fine-tuning
             model = prepare_model_for_kbit_training(model)
-            model = get_peft_model(model, lora_config)
+            
+            # Make all parameters trainable for full model fine-tuning
+            for param_name, param in model.named_parameters():
+                param.requires_grad = True
             
             # Reduce batch size and increase gradient accumulation
             training_args.per_device_train_batch_size = 1
@@ -1230,17 +1222,46 @@ try:
     print(f"\nTraining completed in {elapsed_time/60:.2f} minutes")
     print(f"Training loss: {train_result.metrics['train_loss']:.4f}")
     
-    # Save the model
-    print("\nSaving model...")
+    # Save the full fine-tuned model
+    print("\nSaving full fine-tuned model...")
     trainer.save_model("./phi3_swift_model")
     
-    # Save adapter separately for easier loading
+    # Save the model weights in a format optimized for inference
     if hasattr(model, "save_pretrained"):
         try:
-            model.save_pretrained("./phi3_swift_model_adapter")
-            print("Saved LoRA adapter to ./phi3_swift_model_adapter")
+            # Save the model in a format that can be directly loaded for inference
+            print("Saving model in optimized format for inference...")
+            
+            # Create a directory for the optimized model
+            os.makedirs("./phi3_swift_model_inference", exist_ok=True)
+            
+            # Save the model config and tokenizer
+            model.config.save_pretrained("./phi3_swift_model_inference")
+            tokenizer.save_pretrained("./phi3_swift_model_inference")
+            
+            # Save the model weights
+            model.save_pretrained(
+                "./phi3_swift_model_inference",
+                safe_serialization=True,  # Use safetensors format
+                max_shard_size="2GB"      # Shard into smaller files for easier distribution
+            )
+            print("Saved full model weights to ./phi3_swift_model_inference")
+            
+            # Save a model card with information about the training
+            with open("./phi3_swift_model_inference/README.md", "w") as f:
+                f.write(f"# Fine-tuned Phi-3 Model for Swift\n\n")
+                f.write(f"This model was fine-tuned from {MODEL_NAME}.\n\n")
+                f.write(f"Training completed in {elapsed_time/60:.2f} minutes with a final loss of {train_result.metrics['train_loss']:.4f}.\n\n")
+                f.write("## Model Details\n\n")
+                f.write(f"- Base model: {MODEL_NAME}\n")
+                f.write(f"- Full fine-tuning (not adapter-based)\n")
+                f.write(f"- Trained for {NUM_EPOCHS} epochs\n")
+                f.write(f"- Learning rate: {LEARNING_RATE}\n")
+                f.write(f"- Batch size: {BATCH_SIZE} per device, with gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}\n")
+                
         except Exception as save_error:
-            print(f"Error saving adapter: {save_error}")
+            print(f"Error saving full model weights: {save_error}")
+            print("Training weights are still saved in ./phi3_swift_model")
     
     print("Model saved successfully")
     
@@ -1258,6 +1279,19 @@ except Exception as e:
     try:
         print("\nAttempting to save checkpoint after error...")
         trainer.save_model("./phi3_swift_model_checkpoint_after_error")
+        
+        # Try to save a model card with error information
+        try:
+            with open("./phi3_swift_model_checkpoint_after_error/README.md", "w") as f:
+                f.write("# Emergency Checkpoint After Error\n\n")
+                f.write(f"This is an emergency checkpoint of the full fine-tuned model saved after encountering an error.\n\n")
+                f.write(f"## Error information\n\n")
+                f.write(f"Error: {str(e)}\n\n")
+                f.write(f"Base model: {MODEL_NAME}\n")
+                f.write(f"Training mode: Full model fine-tuning\n")
+        except:
+            pass
+            
         print("Emergency checkpoint saved to ./phi3_swift_model_checkpoint_after_error")
     except:
         print("Could not save emergency checkpoint")
