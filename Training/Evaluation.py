@@ -188,7 +188,10 @@ def prepare_swift_benchmark():
 
 def generate_response(model, tokenizer, prompt, max_tokens=200, device="cuda"):
     """Generate a response from the model."""
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    # Explicitly create attention mask along with input ids
+    encoding = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=len(prompt) + max_tokens)
+    input_ids = encoding.input_ids.to(device)
+    attention_mask = encoding.attention_mask.to(device)
     
     # Add a monkey patch for the DynamicCache class to handle API change
     # The error occurs because get_max_length() was renamed to get_seq_length()
@@ -197,16 +200,33 @@ def generate_response(model, tokenizer, prompt, max_tokens=200, device="cuda"):
         DynamicCache.get_max_length = DynamicCache.get_seq_length
     
     with torch.no_grad():
+        # Set use_cache=True and output_attentions=False to avoid dimension mismatches
         outputs = model.generate(
-            inputs.input_ids,
+            input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_tokens,
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            output_attentions=False,
+            return_dict_in_generate=True,
+            # Fix for tensor size mismatch in attention mask
+            use_attention_mask=True
         )
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # Extract generated sequence
+    if hasattr(outputs, "sequences"):
+        # For newer transformers versions that return a dict
+        generated_sequence = outputs.sequences[0]
+    else:
+        # For older versions that return a tensor directly
+        generated_sequence = outputs[0]
+    
+    response = tokenizer.decode(generated_sequence, skip_special_tokens=True)
+    
     # Extract just the assistant's response
     if "<|assistant|>" in response:
         response = response.split("<|assistant|>")[-1].strip()
